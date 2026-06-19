@@ -1,17 +1,27 @@
 //! luadejit-core: LuaJIT bytecode decompiler library.
 //!
-//! Currently at Stage 0 (project skeleton). The `decompile` function
-//! is a stub; real implementation lands in subsequent stages per
-//! `docs/implementation-plan.md`.
+//! The pipeline is: parse bytecode ([`frontend::Module::from_bytes`])
+//! → emit source ([`emit::emit_module`]). Higher-level stages of the
+//! implementation plan (CFG, SSA, structural recovery, etc.) slot in
+//! between these two steps in later work; Stage 1 implements only the
+//! degenerate RET0-only case end-to-end so the plumbing is proven.
+
+pub mod emit;
+pub mod frontend;
+
+use frontend::Module;
 
 /// Decompile LuaJIT bytecode bytes into Lua source code.
 ///
-/// Stage 0 stub: always returns `DecompilerError::NotImplemented`.
-/// Real pipeline (frontend → CFG → SSA → analyses → transforms →
-/// structural recovery → phi elimination → emission) comes in
-/// Stages 1–17 of the implementation plan.
-pub fn decompile(_bytes: &[u8]) -> Result<String, DecompilerError> {
-    Err(DecompilerError::NotImplemented)
+/// Stage 1: handles only the degenerate case where the main proto's
+/// only real instruction is `RET0` (i.e. the source chunk was just
+/// `return`). Returns empty source for that case. Returns
+/// [`DecompilerError::NotImplemented`] for any other input and
+/// [`DecompilerError::InvalidBytecode`] for malformed bytecode.
+pub fn decompile(bytes: &[u8]) -> Result<String, DecompilerError> {
+    let module = Module::from_bytes(bytes)?;
+    let source = emit::emit_module(&module)?;
+    Ok(source)
 }
 
 /// Errors that can occur during decompilation.
@@ -19,13 +29,18 @@ pub fn decompile(_bytes: &[u8]) -> Result<String, DecompilerError> {
 pub enum DecompilerError {
     /// Decompile functionality not yet implemented for this input.
     NotImplemented,
-    // Additional variants added in later stages.
+    /// The input is not well-formed LuaJIT bytecode. `offset` is the
+    /// absolute byte position where parsing failed.
+    InvalidBytecode { offset: usize, reason: String },
 }
 
 impl std::fmt::Display for DecompilerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DecompilerError::NotImplemented => write!(f, "decompile not implemented yet"),
+            DecompilerError::InvalidBytecode { offset, reason } => {
+                write!(f, "invalid bytecode at offset {}: {}", offset, reason)
+            }
         }
     }
 }
@@ -36,9 +51,20 @@ impl std::error::Error for DecompilerError {}
 mod tests {
     use super::*;
 
+    /// Garbage input should fail at the parser, not return NotImplemented.
+    /// Stage 0's stub returned NotImplemented for any input; Stage 1
+    /// instead surfaces InvalidBytecode for malformed dumps.
     #[test]
-    fn stub_returns_not_implemented() {
+    fn garbage_returns_invalid_bytecode() {
         let result = decompile(b"some bytes");
-        assert!(matches!(result, Err(DecompilerError::NotImplemented)));
+        match result {
+            Err(DecompilerError::InvalidBytecode { reason, .. }) => {
+                assert!(reason.contains("magic"));
+            }
+            other => panic!(
+                "expected Err(InvalidBytecode) for garbage input, got {:?}",
+                other
+            ),
+        }
     }
 }
