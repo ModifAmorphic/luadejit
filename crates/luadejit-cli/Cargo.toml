@@ -1,0 +1,11 @@
+[package]
+name = "luadejit-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "luadejit"
+path = "src/main.rs"
+
+[dependencies]
+luadejit-core = { path = "../luadejit-core" }

@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/luadejit-core", "crates/luadejit-cli"]
+resolver = "2"
