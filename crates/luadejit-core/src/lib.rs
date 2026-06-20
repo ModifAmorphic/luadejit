@@ -3,8 +3,10 @@
 //! The pipeline is: parse bytecode ([`ir::Module::from_bytes`])
 //! → emit source ([`emit::emit_module`]). Higher-level stages of the
 //! implementation plan (CFG, SSA, structural recovery, etc.) slot in
-//! between these two steps in later work; Stage 1 implements only the
-//! degenerate RET0-only case end-to-end so the plumbing is proven.
+//! between these two steps in later work. Currently handles the
+//! Stage 1 RET0-only case (empty source) and the Stage 2
+//! `return <const>` case (integer/number/string/bool/nil constants);
+//! anything else returns [`DecompilerError::NotImplemented`].
 
 pub mod emit;
 pub mod frontend;
@@ -14,11 +16,15 @@ use ir::Module;
 
 /// Decompile LuaJIT bytecode bytes into Lua source code.
 ///
-/// Stage 1: handles only the degenerate case where the main proto's
-/// only real instruction is `RET0` (i.e. the source chunk was just
-/// `return`). Returns empty source for that case. Returns
-/// [`DecompilerError::NotImplemented`] for any other input and
-/// [`DecompilerError::InvalidBytecode`] for malformed bytecode.
+/// Currently handles two shapes of main proto:
+/// - **Stage 1**: a single `RET0` (source was just `return`) →
+///   emits empty source.
+/// - **Stage 2**: `[<load_const>, RET1 0 2]` where the load is one of
+///   KSHORT/KNUM/KSTR/KPRI → emits `return <const>` for integer,
+///   number, string, bool, and nil constants.
+///
+/// Returns [`DecompilerError::NotImplemented`] for any other shape
+/// and [`DecompilerError::InvalidBytecode`] for malformed bytecode.
 pub fn decompile(bytes: &[u8]) -> Result<String, DecompilerError> {
     let module = Module::from_bytes(bytes)?;
     let source = emit::emit_module(&module)?;
