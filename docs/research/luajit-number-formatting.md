@@ -67,7 +67,10 @@ Grisu/Ryū) that prioritizes round-trip correctness over brevity:
 A pure-Rust formatter that matches `%.14g`. Suggested approach:
 
 1. Handle special cases first: `inf`, `-inf`, `nan`, `-0.0`.
-2. Use `format!("{:.14e}", val)` to get 14-digit scientific notation.
+2. Use `format!("{:.13e}", val)` to get 14-significant-digit scientific
+   notation. (Rust's `{:.Ne}` precision counts digits *after* the radix
+   point, so `{:.13e}` = 1 before + 13 after = 14 sig figs, matching
+   `%.14g`. Using `{:.14e}` would give 15 sig figs.)
 3. Parse the exponent from the result.
 4. If exponent is in range [-4, 14): reformat as decimal (strip
    trailing zeros, handle integer-valued floats).
