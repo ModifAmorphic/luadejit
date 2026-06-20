@@ -114,10 +114,11 @@ prioritized them because they're rare.
 
 **Implication for Stage 11**: the No More Gotos algorithm's
 cyclic-region structuring (the hardest part to implement) is
-exercised by only 2.6% of the corpus. If implementation time gets
-tight, while/repeat recovery could be deferred past v1.0 without
-affecting most of the corpus. But per the v1 scope ("17 stages
-done"), Stage 11 is included.
+exercised by only 2.6% of the corpus. But this doesn't mean
+while/repeat should be deferred — the algorithm handles all loops
+(including for-loops) uniformly, so while/repeat support is inherent
+to implementing cyclic region structuring. There's no incremental
+complexity cost to including it. Stage 11 stays in scope.
 
 ## FR1/FR2 testing asymmetry
 
