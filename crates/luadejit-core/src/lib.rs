@@ -13,6 +13,7 @@
 pub mod emit;
 pub mod frontend;
 pub mod ir;
+pub mod number;
 
 use ir::Module;
 
