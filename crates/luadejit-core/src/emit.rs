@@ -7,7 +7,7 @@
 //! returns [`DecompilerError::NotImplemented`] — the pipeline grows
 //! into more cases in later stages.
 
-use crate::frontend::{Module, Opcode};
+use crate::ir::{Module, Opcode};
 use crate::DecompilerError;
 
 /// Emit Lua source from a parsed module.
@@ -30,7 +30,7 @@ pub fn emit_module(module: &Module) -> Result<String, DecompilerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frontend::{
+    use crate::ir::{
         DebugInfo, GcConst, Instruction, ModuleHeader, NumConst, Opcode, Proto, UpvalDesc,
     };
 
