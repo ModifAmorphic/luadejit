@@ -27,6 +27,13 @@
 //!   now emit `local <name> = <expr>` (and store the name for later
 //!   reference), and (b) `MOV A D` is supported (copies slot D's
 //!   expression into slot A, with the same named-local handling).
+//! - **Stage 6**: handles local reassignment. A second store to a
+//!   slot whose variable is already in scope (`local a = 1; a = 2`)
+//!   now emits `a = 2` (no `local`), instead of incorrectly
+//!   re-declaring the variable. The discriminator is
+//!   [`Proto::is_var_declaration_at`]: stores where the instruction
+//!   index equals the variable's `scope_begin` are declarations; all
+//!   other stores to a named slot are reassignments.
 //!
 //! Every other input returns [`DecompilerError::NotImplemented`] —
 //! the pipeline grows into more cases in later stages.
@@ -42,11 +49,13 @@ use crate::DecompilerError;
 /// Walks the main proto's real instructions in order, threading a
 /// `slot_exprs` map (register slot → the source expression currently
 /// occupying it). Constant-load opcodes, arithmetic opcodes, and `MOV`
-/// may all emit a `local` declaration when the debug info names their
-/// target slot — the [`assign_slot`] helper centralizes that decision.
-/// `RET0` terminates the chunk (possibly with no emitted statements);
-/// `RET1` materializes one slot's expression as the return value.
-/// Any opcode not yet handled, or any shape we can't model, returns
+/// may all emit a `local` declaration or a bare reassignment when the
+/// debug info names their target slot — the [`assign_slot`] helper
+/// centralizes that decision (Stage 6: declaration iff the instruction
+/// index equals the variable's `scope_begin`). `RET0` terminates the
+/// chunk (possibly with no emitted statements); `RET1` materializes
+/// one slot's expression as the return value. Any opcode not yet
+/// handled, or any shape we can't model, returns
 /// [`DecompilerError::NotImplemented`].
 pub fn emit_module(module: &Module) -> Result<String, DecompilerError> {
     let main = module.main_proto();
@@ -191,16 +200,27 @@ fn lookup_operand(slot_exprs: &HashMap<u8, String>, slot: u8) -> Result<String, 
 }
 
 /// Record a slot's expression. If the proto's debug section names the
-/// slot as a live local at `inst_index`, emit a `local <name> = <expr>`
-/// declaration and store the *name* under the slot (so a later `return
-/// <name>` references the local). Otherwise, store the expression as
-/// an unnamed temporary that only surfaces when a later instruction
-/// (e.g. `RET1`) reads the slot.
+/// slot as a live local at `inst_index`, emit either a declaration or
+/// reassignment:
+///
+/// - **Declaration** (`is_var_declaration_at` returns true — the
+///   instruction index equals the variable's `scope_begin`): emit
+///   `local <name> = <expr>`.
+/// - **Reassignment** (the slot has a named local in scope, but the
+///   instruction is past its declaration point): emit `<name> = <expr>`
+///   without the `local` keyword.
+///
+/// Both paths store the *name* under the slot (so a later
+/// `return <name>` references the local, not the original expression).
+/// When the slot has no named local, the expression is recorded as an
+/// unnamed temporary that only surfaces when a later instruction (e.g.
+/// `RET1`) reads the slot.
 ///
 /// Shared by the constant-load, arithmetic, and `MOV` arms of the walk
-/// — all three share the same "destination slot may or may not be a
-/// named local" bookkeeping. The discriminator is purely the debug
-/// info's [`Proto::var_name_at`]; the bytecode shape is identical
+/// — all three share the same "destination slot may be a declaration,
+/// reassignment, or unnamed temporary" bookkeeping. The discriminator
+/// is purely the debug info's [`Proto::var_name_at`] plus
+/// [`Proto::is_var_declaration_at`]; the bytecode shape is identical
 /// either way.
 fn assign_slot(
     proto: &Proto,
@@ -211,7 +231,13 @@ fn assign_slot(
     inst_index: usize,
 ) {
     if let Some(name) = proto.var_name_at(slot, inst_index) {
-        lines.push(format!("local {} = {}", name, expr));
+        if proto.is_var_declaration_at(slot, inst_index) {
+            // Declaration: `local name = expr`.
+            lines.push(format!("local {} = {}", name, expr));
+        } else {
+            // Reassignment: `name = expr` (no `local` keyword).
+            lines.push(format!("{} = {}", name, expr));
+        }
         slot_exprs.insert(slot, name.to_string());
     } else {
         slot_exprs.insert(slot, expr);
@@ -1304,6 +1330,71 @@ mod tests {
             matches!(result, Err(DecompilerError::NotImplemented)),
             "expected NotImplemented for chunk without return, got {:?}",
             result
+        );
+    }
+
+    // ---- Stage 6: local reassignment -------------------------------
+    //
+    // A second store to a slot whose variable is already in scope
+    // must emit `<name> = <expr>` (no `local`), not re-declare the
+    // variable. The bytecode shape is identical to a multi-declaration
+    // sequence — the only difference is the var_info's `scope_begin`.
+    // A single record spanning multiple stores is what `luajit -bl`
+    // produces for `local a = 1; a = 2`.
+
+    #[test]
+    fn emit_reassignment_omits_local_keyword() {
+        // `local a = 1; a = 2; return a`:
+        //   KSHORT 0 1; KSHORT 0 2; RET1 0 2.
+        // var_info has ONE record (slot 0, "a", scope [0, 2]) — both
+        // KSHORT stores target the same variable. The first store is
+        // at instruction 0 == scope_begin, so it's a declaration; the
+        // second is at instruction 1 != scope_begin, so it's a
+        // reassignment and must omit `local`.
+        let insts = vec![
+            ad(Opcode::Kshort, 0, 1),
+            ad(Opcode::Kshort, 0, 2),
+            ad(Opcode::Ret1, 0, 2),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "a", 0, 2)],
+            Vec::new(),
+            Vec::new(),
+            1,
+        );
+        assert_eq!(
+            emit_module(&module).unwrap(),
+            "local a = 1\na = 2\nreturn a"
+        );
+    }
+
+    #[test]
+    fn emit_reassignment_with_arith() {
+        // `local a = 1; a = a + 1; return a`:
+        //   KSHORT 0 1; ADDVN 0 0 0; RET1 0 2.
+        // ADDVN reads slot 0 (resolving the left operand to "a" via
+        // the prior KSHORT's stored name) and writes back to slot 0.
+        // The write is at instruction 1, past scope_begin 0, so the
+        // walk emits `a = a + 1` (no `local`). This case matters
+        // because the same instruction reads AND writes the slot —
+        // the left operand must be resolved before the slot is
+        // overwritten with the new expression.
+        let insts = vec![
+            ad(Opcode::Kshort, 0, 1),
+            abc(Opcode::Addvn, 0, 0, 0),
+            ad(Opcode::Ret1, 0, 2),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "a", 0, 2)],
+            Vec::new(),
+            vec![NumConst::Int(1)],
+            1,
+        );
+        assert_eq!(
+            emit_module(&module).unwrap(),
+            "local a = 1\na = a + 1\nreturn a"
         );
     }
 }

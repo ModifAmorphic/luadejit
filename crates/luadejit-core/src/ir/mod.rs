@@ -170,6 +170,33 @@ impl Proto {
         }
         None
     }
+
+    /// Whether the given instruction index is the declaration point
+    /// (`scope_begin`) of a named variable at the given slot. Used by
+    /// the emitter to distinguish `local x = ...` (declaration) from
+    /// `x = ...` (reassignment).
+    ///
+    /// Returns `false` if no named variable occupies the slot at this
+    /// instruction, or if the instruction is past the declaration point
+    /// (meaning the variable is being reassigned, not declared).
+    ///
+    /// Only checks `scope_begin == inst_index`, not the full scope
+    /// range: if `scope_begin` matches, the variable is by definition
+    /// in scope (`scope_end >= scope_begin`). Uses `.any()` — in
+    /// well-formed bytecode at most one variable is declared at a given
+    /// slot+instruction, so the first match is authoritative. Returns
+    /// `false` for stripped protos (no debug info); the emitter then
+    /// treats the store as an unnamed temporary, preserving existing
+    /// behavior for stripped code.
+    pub fn is_var_declaration_at(&self, slot: u8, inst_index: usize) -> bool {
+        let debug = match self.debug.as_ref() {
+            Some(d) => d,
+            None => return false,
+        };
+        debug.var_info.iter().any(|var| {
+            var.slot == slot && var.kind == VarKind::Name && var.scope_begin as usize == inst_index
+        })
+    }
 }
 
 // ---- Instruction types -----------------------------------------------
@@ -745,5 +772,59 @@ mod tests {
             }),
         };
         assert_eq!(proto.var_name_at(0, 0), None);
+    }
+
+    // ---- is_var_declaration_at (Stage 6 declaration/reassignment) ----
+
+    /// Build a proto with a single var_info record: "a" at slot 0
+    /// with scope [0, 2] — the shape `luajit -bl` produces for
+    /// `local a = 1; a = 2; return a` (one variable declared at
+    /// instruction 0, in scope across all three real instructions).
+    fn proto_with_reassigned_a() -> Proto {
+        Proto {
+            flags: 0,
+            numparams: 0,
+            framesize: 1,
+            upvalues: Vec::new(),
+            gc_consts: Vec::new(),
+            num_consts: Vec::new(),
+            insts: Vec::new(),
+            debug: Some(DebugInfo {
+                var_info: vec![named_local(0, "a", 0, 2)],
+                ..DebugInfo::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn is_var_declaration_at_returns_true_at_scope_begin() {
+        // The declaration point: instruction 0 == scope_begin 0.
+        let proto = proto_with_reassigned_a();
+        assert!(proto.is_var_declaration_at(0, 0));
+    }
+
+    #[test]
+    fn is_var_declaration_at_returns_false_after_scope_begin() {
+        // A later store to the same in-scope slot: instruction 1 is
+        // inside the scope [0, 2] but past the declaration point.
+        let proto = proto_with_reassigned_a();
+        assert!(!proto.is_var_declaration_at(0, 1));
+        assert!(!proto.is_var_declaration_at(0, 2));
+    }
+
+    #[test]
+    fn is_var_declaration_at_returns_false_for_wrong_slot() {
+        // No variable is declared at slot 1 / instruction 0.
+        let proto = proto_with_reassigned_a();
+        assert!(!proto.is_var_declaration_at(1, 0));
+    }
+
+    #[test]
+    fn is_var_declaration_at_returns_false_for_stripped() {
+        // Stripped proto (no debug info): always false — the emitter
+        // then treats every store as an unnamed temporary, matching
+        // the existing behavior for stripped code.
+        let proto = stripped_proto();
+        assert!(!proto.is_var_declaration_at(0, 0));
     }
 }
