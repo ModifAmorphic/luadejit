@@ -16,9 +16,16 @@
 //!   names as a live local, we emit `local x = <const>; return x`
 //!   (or just `local x = <const>` when the implicit return is
 //!   `RET0`). The debug info is the discriminator.
+//! - **Stage 4**: handles single binary arithmetic expressions whose
+//!   result is returned (`Addvn`/`Addnv`/`Addvv` and the `Sub`/`Mul`/
+//!   `Div`/`Mod` variants, plus `Pow` and `Cat`). The walk records the
+//!   expression string for the destination slot without emitting a
+//!   line; `RET1` then surfaces the expression as the returned value.
 //!
 //! Every other input returns [`DecompilerError::NotImplemented`] —
 //! the pipeline grows into more cases in later stages.
+
+use std::collections::HashMap;
 
 use crate::ir::{GcConst, Instruction, Module, NumConst, Opcode, Proto};
 use crate::number::format_lua_number;
@@ -26,103 +33,73 @@ use crate::DecompilerError;
 
 /// Emit Lua source from a parsed module.
 ///
-/// See the module docs for the cases currently handled. Returns
-/// [`DecompilerError::NotImplemented`] for any input that doesn't
-/// match a handled shape.
+/// Walks the main proto's real instructions in order, threading a
+/// `slot_exprs` map (register slot → the source expression currently
+/// occupying it). Constant-load opcodes may also emit a `local`
+/// declaration when the debug info names their target slot. `RET0`
+/// terminates the chunk (possibly with no emitted statements);
+/// `RET1` materializes one slot's expression as the return value.
+/// Any opcode not yet handled, or any shape we can't model, returns
+/// [`DecompilerError::NotImplemented`].
 pub fn emit_module(module: &Module) -> Result<String, DecompilerError> {
     let main = module.main_proto();
     // Slot 0 is the synthesized FUNC* header; real instructions start
-    // at index 1.
+    // at index 1. The walk index is relative to `real_insts`, which
+    // matches the convention `var_name_at` expects (0 = first real
+    // instruction, not counting the FUNC* header at in-memory slot 0).
     let real_insts = &main.insts[1..];
 
-    // Stage 1: RET0-only -> empty source.
-    if real_insts.len() == 1 && real_insts[0].op == Opcode::Ret0 {
-        return Ok(String::new());
-    }
+    let mut slot_exprs: HashMap<u8, String> = HashMap::new();
+    let mut lines: Vec<String> = Vec::new();
+    let mut saw_return = false;
 
-    // Stage 2/3: exactly 2 real instructions = a constant load
-    // followed by a return.
-    if real_insts.len() == 2 {
-        let load = &real_insts[0];
-        let ret = &real_insts[1];
-
-        // Stage 3: if the load target is a named local at instruction
-        // 0, the chunk is `local x = <const>[; return x]` rather than
-        // `return <const>`. The bytecode is identical to Stage 2's;
-        // var_info is the discriminator.
-        if let Some(name) = main.var_name_at(load.a, 0) {
-            return emit_local_declaration(main, load, ret, name);
-        }
-
-        // Stage 2: transient const loaded into r0 and returned.
-        if ret.op == Opcode::Ret1 {
-            return emit_return_const(main, load, ret);
-        }
-    }
-
-    Err(DecompilerError::NotImplemented)
-}
-
-/// Emit a `return <const>` chunk: a single constant-load instruction
-/// into r0 followed by `RET1 0 2`.
-///
-/// `RET1 A D` returns one value from `r(A)`; for `return <single
-/// const>` LuaJIT always emits `RET1 0 2` (`A=0` = the loaded
-/// register, `D=2` = multres base for "1 return value"). We enforce
-/// that exact shape plus `load.a == 0` and bail with
-/// [`DecompilerError::NotImplemented`] for anything else, since other
-/// shapes belong to later stages (multi-return, partial returns,
-/// etc.).
-fn emit_return_const(
-    proto: &Proto,
-    load: &Instruction,
-    ret: &Instruction,
-) -> Result<String, DecompilerError> {
-    // RET1 must target r0 with the single-value-return convention.
-    if ret.a != 0 || ret.d() != 2 {
-        return Err(DecompilerError::NotImplemented);
-    }
-    // The load must target r0 (the register RET1 reads from).
-    if load.a != 0 {
-        return Err(DecompilerError::NotImplemented);
-    }
-    let expr = const_load_expr(proto, load)?;
-    Ok(format!("return {}", expr))
-}
-
-/// Emit a `local <name> = <const>` chunk. `load` is the constant-load
-/// instruction that initializes the local; `ret` is the following
-/// return instruction (either `RET0` for an implicit return at end of
-/// chunk, or `RET1 <slot> 2` for an explicit `return <name>`).
-///
-/// We enforce the exact return shape and bail with
-/// [`DecompilerError::NotImplemented`] for anything else — other
-/// shapes (multiple returns, partial returns, etc.) belong to later
-/// stages.
-fn emit_local_declaration(
-    proto: &Proto,
-    load: &Instruction,
-    ret: &Instruction,
-    name: &str,
-) -> Result<String, DecompilerError> {
-    let expr = const_load_expr(proto, load)?;
-    match ret.op {
-        Opcode::Ret0 => {
-            // `local x = <const>` with implicit return at end of chunk.
-            Ok(format!("local {} = {}", name, expr))
-        }
-        Opcode::Ret1 => {
-            // RET1 must read the same slot the load wrote, with D=2.
-            if ret.a != load.a || ret.d() != 2 {
-                return Err(DecompilerError::NotImplemented);
+    for (idx, inst) in real_insts.iter().enumerate() {
+        match inst.op {
+            Opcode::Ret0 => {
+                // Implicit end-of-chunk return. No statement emitted;
+                // whatever's accumulated in `lines` is the source.
+                saw_return = true;
+                break;
             }
-            // `local x = <const>\nreturn x`. The `\n` is an internal
-            // statement separator; there is no trailing newline
-            // (consistent with Stages 1-2).
-            Ok(format!("local {} = {}\nreturn {}", name, expr, name))
+            Opcode::Ret1 => {
+                // `RET1 A D` returns one value from `r(A)`; the
+                // single-value-return convention is `D == 2`. We don't
+                // restrict `A` to 0 (it can be any slot whose
+                // expression we've recorded); a slot with no recorded
+                // expression means we've hit a shape we don't model.
+                if inst.d() != 2 {
+                    return Err(DecompilerError::NotImplemented);
+                }
+                let expr = slot_exprs
+                    .get(&inst.a)
+                    .ok_or(DecompilerError::NotImplemented)?;
+                lines.push(format!("return {}", expr));
+                saw_return = true;
+                break;
+            }
+            Opcode::Kshort | Opcode::Knum | Opcode::Kstr | Opcode::Kpri => {
+                let expr = const_load_expr(main, inst)?;
+                // Stage 3 discriminator: if the debug section names
+                // this slot as a live local at this instruction, the
+                // load is a `local <name> = <expr>` declaration rather
+                // than a transient write. We emit the line AND record
+                // the *name* (not the expression) under the slot, so a
+                // later `return <name>` references the local.
+                if let Some(name) = main.var_name_at(inst.a, idx) {
+                    lines.push(format!("local {} = {}", name, expr));
+                    slot_exprs.insert(inst.a, name.to_string());
+                } else {
+                    slot_exprs.insert(inst.a, expr);
+                }
+            }
+            _ => return Err(DecompilerError::NotImplemented),
         }
-        _ => Err(DecompilerError::NotImplemented),
     }
+
+    if !saw_return {
+        return Err(DecompilerError::NotImplemented);
+    }
+    Ok(lines.join("\n"))
 }
 
 /// Render the source expression produced by a constant-load
