@@ -80,46 +80,38 @@ impl<'a> Reader<'a> {
     }
 
     /// Read a standard unsigned LEB128 value (format doc §9). The
-    /// result is the decoded 32-bit value. Continuation bytes are
-    /// consumed until the high bit is clear. A hard cap of 10 bytes
-    /// guards against malicious inputs that would otherwise spin
-    /// forever; well-formed 32-bit ULEB128s never exceed 5 bytes.
+    /// result is the decoded 32-bit value.
+    ///
+    /// Well-formed 32-bit ULEB128s never exceed 5 bytes (5*7 = 35 >= 32).
+    /// This reader enforces that canonical limit strictly: a sequence
+    /// longer than 5 bytes — or one whose decoded value exceeds 32 bits
+    /// — is rejected as `InvalidBytecode`. Over-long encodings are a
+    /// sign of a buggy or malicious writer and provide no legitimate
+    /// expressiveness for a 32-bit field, so they are not tolerated.
+    ///
+    /// Accumulation happens in a `u64` so the final 5th-byte shift (at
+    /// bit 28) can set bits above bit 31 without silently truncating;
+    /// the value is then validated to fit `u32` before being returned.
     pub fn read_uleb128(&mut self) -> Result<u32, DecompilerError> {
-        let mut v: u32 = 0;
+        let mut v: u64 = 0;
         let mut shift: u32 = 0;
-        // 5 bytes is sufficient for any 32-bit value (5*7 = 35 >= 32).
-        // Allow a few extra continuation bytes for tolerance, then
-        // reject anything longer as malformed.
-        const MAX_BYTES: usize = 10;
-        for i in 0..MAX_BYTES {
+        const MAX_BYTES: usize = 5; // canonical max for a 32-bit ULEB128
+        for _ in 0..MAX_BYTES {
             let b = self.read_u8()?;
-            let contribution = u32::from(b & 0x7f);
-            if shift < 32 {
-                v |= contribution << shift;
-            } else if contribution != 0 {
-                // Set bits beyond bit 31 — invalid for a 32-bit value.
-                return Err(DecompilerError::InvalidBytecode {
-                    offset: self.pos,
-                    reason: "ULEB128 value exceeds 32 bits".to_string(),
-                });
-            }
+            v |= u64::from(b & 0x7f) << shift;
             if b & 0x80 == 0 {
-                return Ok(v);
-            }
-            shift = shift.saturating_add(7);
-            // After MAX_BYTES-1 continuation bytes there's no point
-            // continuing; treat as malformed.
-            if i + 1 == MAX_BYTES {
-                return Err(DecompilerError::InvalidBytecode {
+                return u32::try_from(v).map_err(|_| DecompilerError::InvalidBytecode {
                     offset: self.pos,
-                    reason: "ULEB128 sequence too long".to_string(),
+                    reason: format!("ULEB128 value 0x{:x} exceeds 32 bits", v),
                 });
             }
+            shift += 7;
         }
-        // Unreachable: loop either returns or errors.
+        // Still in continuation after 5 bytes — non-canonical for a
+        // u32 ULEB128; treat as malformed.
         Err(DecompilerError::InvalidBytecode {
             offset: self.pos,
-            reason: "ULEB128 sequence too long".to_string(),
+            reason: "ULEB128 sequence exceeds 5 bytes (canonical limit for u32)".to_string(),
         })
     }
 
@@ -132,34 +124,41 @@ impl<'a> Reader<'a> {
     /// the value (with the top bit acting as the standard LEB128
     /// continuation flag). Subsequent bytes contribute 7 more bits
     /// each, in standard LEB128 fashion.
+    ///
+    /// Well-formed 33-bit ULEB128s never exceed 6 bytes total (1 first
+    /// byte with 6 value bits + up to 5 continuation bytes). This
+    /// reader caps the continuation at 5 bytes and rejects anything
+    /// longer as malformed. The decoded value is validated to fit
+    /// `u32` before being returned (the 33rd bit is only meaningful
+    /// for sign-extension of integer constants, handled by the caller;
+    /// values exceeding `u32::MAX` are out of range for this reader).
     pub fn read_uleb128_33(&mut self) -> Result<(u32, u8), DecompilerError> {
         let byte0 = self.read_u8()?;
         let tag = byte0 & 1;
-        // Use u64 internally so later shifts (which can reach bit 27)
-        // never overflow even when the masked-in byte is 0x7f.
+        // Accumulate in u64 so the later continuation shifts (which can
+        // reach bit 34) never silently truncate.
         let mut v: u64 = u64::from(byte0 >> 1);
         if v >= 0x40 {
-            // Continuation bit (top of the 7 value bits) was set.
+            // Continuation bit (top of the first byte's 7 value bits)
+            // was set: mask it off and read continuation bytes.
             v &= 0x3f;
             let mut shift: u32 = 6;
-            const MAX_BYTES: usize = 9;
-            for i in 0..MAX_BYTES {
+            const MAX_CONT: usize = 5; // canonical max continuation bytes for 33-bit
+            for _ in 0..MAX_CONT {
                 let b = self.read_u8()?;
-                let contribution = u64::from(b & 0x7f);
-                v |= contribution << shift;
+                v |= u64::from(b & 0x7f) << shift;
                 if b & 0x80 == 0 {
-                    return Ok((v as u32, tag));
+                    return pack_uleb128_33(v, tag, self.pos);
                 }
-                shift = shift.saturating_add(7);
-                if i + 1 == MAX_BYTES {
-                    return Err(DecompilerError::InvalidBytecode {
-                        offset: self.pos,
-                        reason: "ULEB128_33 sequence too long".to_string(),
-                    });
-                }
+                shift += 7;
             }
+            return Err(DecompilerError::InvalidBytecode {
+                offset: self.pos,
+                reason: "ULEB128_33 sequence exceeds 6 bytes (canonical limit for 33-bit)"
+                    .to_string(),
+            });
         }
-        Ok((v as u32, tag))
+        pack_uleb128_33(v, tag, self.pos)
     }
 
     fn eof(&self, what: &str) -> DecompilerError {
@@ -179,6 +178,19 @@ impl<'a> Reader<'a> {
                 self.remaining()
             ),
         }
+    }
+}
+
+/// Pack a decoded 33-bit ULEB128 value into the `(u32, tag)` result,
+/// rejecting values that do not fit in 32 bits. Shared by the single-
+/// and multi-byte return paths of [`Reader::read_uleb128_33`].
+fn pack_uleb128_33(v: u64, tag: u8, offset: usize) -> Result<(u32, u8), DecompilerError> {
+    match u32::try_from(v) {
+        Ok(val) => Ok((val, tag)),
+        Err(_) => Err(DecompilerError::InvalidBytecode {
+            offset,
+            reason: format!("ULEB128_33 value 0x{:x} exceeds 32 bits", v),
+        }),
     }
 }
 
@@ -231,8 +243,55 @@ mod tests {
     }
 
     #[test]
+    fn uleb128_overflow_5th_byte() {
+        // 5 bytes, but the 5th contributes bits above bit 31: the
+        // canonical u32::MAX encoding uses 0x0F as the final byte, not
+        // 0x1F. With 0x1F the decoded value is 0x1_FFFF_FFFF (bit 32
+        // set), which exceeds 32 bits and must be rejected rather than
+        // silently truncated to 0xFFFFFFFF.
+        let mut r = Reader::new(&[0xff, 0xff, 0xff, 0xff, 0x1f]);
+        let err = r.read_uleb128().unwrap_err();
+        match err {
+            DecompilerError::InvalidBytecode { reason, .. } => {
+                assert!(reason.contains("exceeds 32 bits"), "reason was: {}", reason);
+            }
+            other => panic!("expected InvalidBytecode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn uleb128_just_over_u32_max() {
+        // 0x1_0000_0000 = one bit over u32::MAX. ULEB128 encoding:
+        //   byte0 = 0x80 (cont, 0 value bits)
+        //   bytes 1-3 = 0x80 (cont, 0 value bits)
+        //   byte4 = 0x10 (final; 0x10 << 28 = bit 32)
+        let mut r = Reader::new(&[0x80, 0x80, 0x80, 0x80, 0x10]);
+        let err = r.read_uleb128().unwrap_err();
+        match err {
+            DecompilerError::InvalidBytecode { reason, .. } => {
+                assert!(reason.contains("exceeds 32 bits"), "reason was: {}", reason);
+            }
+            other => panic!("expected InvalidBytecode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn uleb128_six_bytes_rejected() {
+        // 6 continuation bytes: non-canonical for a u32 ULEB128 (max 5).
+        let mut r = Reader::new(&[0xff; 6]);
+        let err = r.read_uleb128().unwrap_err();
+        match err {
+            DecompilerError::InvalidBytecode { reason, .. } => {
+                assert!(reason.contains("exceeds 5 bytes"), "reason was: {}", reason);
+            }
+            other => panic!("expected InvalidBytecode, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn uleb128_too_long() {
-        // 11 continuation bytes — clearly malformed.
+        // 11 continuation bytes — clearly malformed. Still rejected
+        // (now via the "exceeds 5 bytes" canonical-limit path).
         let mut r = Reader::new(&[0xff; 11]);
         let err = r.read_uleb128().unwrap_err();
         assert!(matches!(err, DecompilerError::InvalidBytecode { .. }));
@@ -261,6 +320,39 @@ mod tests {
         // byte0 = 0x07: value = 0x07>>1 = 3, tag = 1.
         let mut r = Reader::new(&[0x07]);
         assert_eq!(r.read_uleb128_33().unwrap(), (3, 1));
+    }
+
+    #[test]
+    fn uleb128_33_overflow() {
+        // Encode 0x1_0000_0000 (one bit over u32::MAX) in the 33-bit
+        // format with tag = 0:
+        //   byte0 = 0x80 (tag 0, cont, 0 value bits)
+        //   bytes 1-3 = 0x80 (cont, 0 value bits)
+        //   byte4 = 0x20 (final; 0x20 << 27 = bit 32 in the 33-bit field)
+        // The value overflows u32 and must be rejected.
+        let mut r = Reader::new(&[0x80, 0x80, 0x80, 0x80, 0x20]);
+        let err = r.read_uleb128_33().unwrap_err();
+        match err {
+            DecompilerError::InvalidBytecode { reason, .. } => {
+                assert!(reason.contains("exceeds 32 bits"), "reason was: {}", reason);
+            }
+            other => panic!("expected InvalidBytecode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn uleb128_33_too_long() {
+        // byte0 with continuation + 5 continuation bytes all with
+        // continuation set = 6 bytes total, still continuing. Exceeds
+        // the 6-byte canonical limit for a 33-bit value.
+        let mut r = Reader::new(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80]);
+        let err = r.read_uleb128_33().unwrap_err();
+        match err {
+            DecompilerError::InvalidBytecode { reason, .. } => {
+                assert!(reason.contains("exceeds 6 bytes"), "reason was: {}", reason);
+            }
+            other => panic!("expected InvalidBytecode, got {:?}", other),
+        }
     }
 
     #[test]
