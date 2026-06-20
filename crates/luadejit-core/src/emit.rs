@@ -21,6 +21,7 @@
 //! the pipeline grows into more cases in later stages.
 
 use crate::ir::{GcConst, Instruction, Module, NumConst, Opcode, Proto};
+use crate::number::format_lua_number;
 use crate::DecompilerError;
 
 /// Emit Lua source from a parsed module.
@@ -137,25 +138,10 @@ fn const_load_expr(proto: &Proto, load: &Instruction) -> Result<String, Decompil
             Ok(format!("{}", val))
         }
         Opcode::Knum => {
-            // D is a forward index into num_consts.
+            // D is a forward index into num_consts. The shared
+            // helper does the bounds check and renders the value.
             let idx = load.d() as usize;
-            let nc = proto
-                .num_consts
-                .get(idx)
-                .ok_or(DecompilerError::NotImplemented)?;
-            match nc {
-                NumConst::Int(i) => Ok(format!("{}", i)),
-                NumConst::Num(f) => {
-                    // Stage 2 limitation: Rust's `{}` float formatting
-                    // matches Lua's `luajit -bl`/`lua_tostring` for
-                    // common cases like `3.14`, but differs for some
-                    // values (e.g. `3.0` -> Rust emits `3`, Lua emits
-                    // `3.0`). Full Lua-compatible float formatting is
-                    // deferred to a later stage; for now we accept the
-                    // round-trip mismatch on those edge cases.
-                    Ok(format!("{}", f))
-                }
-            }
+            format_num_const(&proto.num_consts, idx)
         }
         Opcode::Kstr => {
             // D is a reverse index into gc_consts — use the helper to
@@ -187,6 +173,23 @@ fn const_load_expr(proto: &Proto, load: &Instruction) -> Result<String, Decompil
         },
         _ => Err(DecompilerError::NotImplemented),
     }
+}
+
+/// Format a number constant from a proto's `num_consts` table by
+/// forward index. Shared by KNUM loading and the arithmetic `*VN` /
+/// `*NV` operand paths, which both resolve number-constant operands
+/// the same way (forward index, LuaJIT-compatible formatting).
+///
+/// Returns [`DecompilerError::NotImplemented`] if `idx` is out of
+/// range — malformed bytecode belongs to the parser, so an out-of-range
+/// index here means we're past the validity boundary and should bail
+/// rather than guess.
+fn format_num_const(num_consts: &[NumConst], idx: usize) -> Result<String, DecompilerError> {
+    let nc = num_consts.get(idx).ok_or(DecompilerError::NotImplemented)?;
+    Ok(match nc {
+        NumConst::Int(i) => format!("{}", i),
+        NumConst::Num(f) => format_lua_number(*f),
+    })
 }
 
 #[cfg(test)]
