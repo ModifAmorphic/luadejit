@@ -323,10 +323,13 @@ gets deferred:
 - Source-level comment inference (we can't recover comments; v1
   doesn't try heuristics).
 
-The scope is deliberately ambitious for v1 — the goal is parity
-with what the current attempt does well, plus the architectural
-improvements (SSA, analysis-based structural recovery). Anything
-that's "nice to have but not necessary" is deferred.
+The scope is defined by the 17 stages in
+`docs/implementation-plan.md`. When all 17 stages are complete, v1.0
+is done. The POC (`luadejit-poc`) is a reference for understanding
+what a LuaJIT decompiler can do, but we do not target feature parity
+with it. The clean-slate implementation stands on its own; its
+success criteria are the stage tests and corpus regression, not a
+comparison against the POC's output.
 
 Note: cascading `elseif` chains are common in real Lua and are
 *not* a separate feature — they're handled by the No More Gotos
