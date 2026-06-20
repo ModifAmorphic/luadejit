@@ -110,6 +110,37 @@ impl Proto {
     pub fn is_vararg(&self) -> bool {
         self.flags & PROTO_VARARG != 0
     }
+
+    /// Resolve a GC-constant operand (from KSTR, FNEW, TDUP, etc.) to
+    /// the GC constant it references.
+    ///
+    /// GC constants are stored in file order but referenced via
+    /// **reverse index**: operand `d` resolves to
+    /// `gc_consts[len() - 1 - d]`. This helper centralizes the
+    /// reverse-index arithmetic so call sites can't accidentally use
+    /// forward indexing — the #1 parser bug per the format doc §6.1.
+    ///
+    /// Returns [`DecompilerError::InvalidBytecode`] if `d` is out of
+    /// range for the proto's GC constant table.
+    pub fn gc_const_for_operand(&self, d: u16) -> Result<&GcConst, DecompilerError> {
+        let d = d as usize;
+        let len = self.gc_consts.len();
+        let idx = len
+            .checked_sub(d + 1)
+            .ok_or_else(|| DecompilerError::InvalidBytecode {
+                // This is a post-parse resolution (we're past the reader),
+                // so there is no meaningful byte offset to report. We use
+                // offset 0 and carry the relevant indices in the reason for
+                // debugging. A dedicated error variant would be cleaner but
+                // is out of scope for this PR.
+                offset: 0,
+                reason: format!(
+                    "GC constant operand {} out of range (table has {} entries)",
+                    d, len
+                ),
+            })?;
+        Ok(&self.gc_consts[idx])
+    }
 }
 
 // ---- Instruction types -----------------------------------------------
@@ -496,4 +527,83 @@ pub enum VarKind {
     ForState,
     /// Generic-for control (`type byte == 6`).
     ForCtl,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `Proto` whose only interesting field is `gc_consts`.
+    /// Everything else is zeroed/empty — sufficient for testing the
+    /// GC-constant operand resolver.
+    fn proto_with_gc_consts(gc: Vec<GcConst>) -> Proto {
+        Proto {
+            flags: 0,
+            numparams: 0,
+            framesize: 0,
+            upvalues: Vec::new(),
+            gc_consts: gc,
+            num_consts: Vec::new(),
+            insts: Vec::new(),
+            debug: None,
+        }
+    }
+
+    #[test]
+    fn gc_const_for_operand_reverse_indexes() {
+        // gc_consts = [A, B, C] (len 3, file order).
+        // Reverse index: operand 0 -> last (C), 1 -> B, 2 -> first (A).
+        let proto = proto_with_gc_consts(vec![
+            GcConst::Str(b"A".to_vec()),
+            GcConst::Str(b"B".to_vec()),
+            GcConst::Str(b"C".to_vec()),
+        ]);
+        // Match on each result so this test doesn't require GcConst to
+        // derive PartialEq (keeps the change off the IR derives).
+        match proto.gc_const_for_operand(0).unwrap() {
+            GcConst::Str(b) => assert_eq!(b, &b"C".to_vec()),
+            other => panic!("operand 0: expected Str(C), got {:?}", other),
+        }
+        match proto.gc_const_for_operand(1).unwrap() {
+            GcConst::Str(b) => assert_eq!(b, &b"B".to_vec()),
+            other => panic!("operand 1: expected Str(B), got {:?}", other),
+        }
+        match proto.gc_const_for_operand(2).unwrap() {
+            GcConst::Str(b) => assert_eq!(b, &b"A".to_vec()),
+            other => panic!("operand 2: expected Str(A), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn gc_const_for_operand_out_of_range() {
+        let proto = proto_with_gc_consts(vec![
+            GcConst::Str(b"A".to_vec()),
+            GcConst::Str(b"B".to_vec()),
+            GcConst::Str(b"C".to_vec()),
+        ]);
+        // operand == len is the first out-of-range value (valid range
+        // is 0..=2).
+        let err = proto.gc_const_for_operand(3).unwrap_err();
+        match err {
+            DecompilerError::InvalidBytecode { offset, reason } => {
+                assert_eq!(offset, 0);
+                assert!(reason.contains("out of range"), "reason was: {}", reason);
+                assert!(reason.contains("3"), "reason was: {}", reason);
+            }
+            other => panic!("expected InvalidBytecode, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn gc_const_for_operand_empty_table() {
+        let proto = proto_with_gc_consts(Vec::new());
+        let err = proto.gc_const_for_operand(0).unwrap_err();
+        match err {
+            DecompilerError::InvalidBytecode { offset, reason } => {
+                assert_eq!(offset, 0);
+                assert!(reason.contains("out of range"), "reason was: {}", reason);
+            }
+            other => panic!("expected InvalidBytecode, got {:?}", other),
+        }
+    }
 }
