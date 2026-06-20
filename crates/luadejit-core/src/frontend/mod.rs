@@ -30,7 +30,9 @@ use crate::ir::{
     DebugInfo, GcConst, Instruction, KtabK, Module, ModuleHeader, NumConst, Opcode, Proto,
     TableConst, UpvalDesc, VarInfo, VarKind,
 };
-use crate::ir::{FLAG_BE, FLAG_STRIP, FLAGS_KNOWN_MASK, PROTO_CHILD, PROTO_FFI, PROTO_VARARG, VAR_STR};
+use crate::ir::{
+    FLAGS_KNOWN_MASK, FLAG_BE, FLAG_STRIP, PROTO_CHILD, PROTO_FFI, PROTO_VARARG, VAR_STR,
+};
 use crate::DecompilerError;
 
 // ---- Parsing-only inherent impls for IR types ------------------------
