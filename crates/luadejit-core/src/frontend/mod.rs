@@ -556,6 +556,111 @@ mod tests {
         out
     }
 
+    // ---- Byte-encoding helpers for synthetic pdata -------------------
+    //
+    // These encode small values the way the parser expects, so the
+    // tests below construct payloads by *intent* rather than by
+    // hand-computed byte tables.
+
+    /// Encode a `u32` as a standard ULEB128.
+    fn uleb128_bytes(mut v: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+                out.push(b);
+            } else {
+                out.push(b);
+                break;
+            }
+        }
+        out
+    }
+
+    /// Encode a value + tag bit as a 33-bit ULEB128 (format doc §6.3).
+    /// `value` is the raw 32-bit value; `tag` is the low bit of byte0.
+    fn uleb128_33_bytes(value: u32, tag: u8) -> Vec<u8> {
+        let mut v = u64::from(value);
+        let mut out = Vec::new();
+        // First byte: bits [6:1] hold the low 6 value bits; bit 0 is
+        // the tag; bit 7 is the continuation flag.
+        let low6 = (v & 0x3f) as u8;
+        v >>= 6;
+        let mut first = (low6 << 1) | (tag & 1);
+        if v == 0 {
+            out.push(first);
+            return out;
+        }
+        first |= 0x80;
+        out.push(first);
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                break;
+            } else {
+                out.push(b | 0x80);
+            }
+        }
+        out
+    }
+
+    /// Build a stripped proto's pdata block from its GC-constant and
+    /// number-constant sections. The instruction count is derived from
+    /// `bcins` (4 bytes per instruction). No upvalues, no debug.
+    fn stripped_pdata(numkgc: u32, kgc: &[u8], numkn: u32, kn: &[u8], bcins: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x02, 0x00, 0x01, 0x00]; // flags=VARARG, params=0, framesize=1, numuv=0
+        out.extend_from_slice(&uleb128_bytes(numkgc));
+        out.extend_from_slice(&uleb128_bytes(numkn));
+        out.extend_from_slice(&uleb128_bytes((bcins.len() / 4) as u32));
+        out.extend_from_slice(bcins);
+        out.extend_from_slice(kgc);
+        out.extend_from_slice(kn);
+        out
+    }
+
+    /// Parse a single stripped proto and return it.
+    fn parse_one_stripped(pdata: &[u8]) -> Proto {
+        let dump = make_dump(FLAG_STRIP, None, pdata);
+        let module = Module::from_bytes(&dump).expect("stripped dump should parse");
+        assert_eq!(module.protos.len(), 1);
+        module.protos.into_iter().next().unwrap()
+    }
+
+    // ---- KtabK encoders (format doc §6.2) ----------------------------
+
+    fn ktabk_nil() -> Vec<u8> {
+        vec![0x00]
+    }
+    fn ktabk_false() -> Vec<u8> {
+        vec![0x01]
+    }
+    fn ktabk_true() -> Vec<u8> {
+        vec![0x02]
+    }
+    fn ktabk_int(v: u32) -> Vec<u8> {
+        let mut o = vec![0x03];
+        o.extend(uleb128_bytes(v));
+        o
+    }
+    fn ktabk_num(f: f64) -> Vec<u8> {
+        let bits = f.to_bits();
+        let lo = bits as u32;
+        let hi = (bits >> 32) as u32;
+        let mut o = vec![0x04];
+        o.extend(uleb128_bytes(lo));
+        o.extend(uleb128_bytes(hi));
+        o
+    }
+    fn ktabk_str(s: &[u8]) -> Vec<u8> {
+        let mut o = vec![5u8 + s.len() as u8];
+        o.extend_from_slice(s);
+        o
+    }
+
     #[test]
     fn rejects_bad_magic() {
         let bytes = [0x00, 0x00, 0x00, 0x02, 0x00, 0x00];
@@ -742,5 +847,288 @@ mod tests {
             c: 0,
         };
         assert_eq!(ad.d(), 0x1234);
+    }
+
+    // ---- GC-constant (KGC) variant coverage (format doc §6.1) --------
+
+    #[test]
+    fn parses_kgc_child() {
+        // KGC_CHILD (tag 0): no payload.
+        let kgc = vec![0x00];
+        let pdata = stripped_pdata(1, &kgc, 0, &[], &[]);
+        let proto = parse_one_stripped(&pdata);
+        assert_eq!(proto.gc_consts.len(), 1);
+        assert!(
+            matches!(proto.gc_consts[0], GcConst::Child),
+            "expected GcConst::Child"
+        );
+    }
+
+    #[test]
+    fn parses_kgc_tab_array_only() {
+        // KGC_TAB: narray=2, nhash=0. Array = [True, Nil] (covers the
+        // KTAB_TRUE and KTAB_NIL ktabk variants).
+        let mut kgc = vec![0x01, 0x02, 0x00]; // tag, narray=2, nhash=0
+        kgc.extend(ktabk_true());
+        kgc.extend(ktabk_nil());
+        let pdata = stripped_pdata(1, &kgc, 0, &[], &[]);
+        let proto = parse_one_stripped(&pdata);
+        let tab = match &proto.gc_consts[0] {
+            GcConst::Tab(t) => t,
+            other => panic!("expected GcConst::Tab, got {:?}", other),
+        };
+        assert_eq!(tab.array.len(), 2);
+        assert!(matches!(tab.array[0], KtabK::True));
+        assert!(matches!(tab.array[1], KtabK::Nil));
+        assert!(tab.hash.is_empty(), "hash part should be empty");
+    }
+
+    #[test]
+    fn parses_kgc_tab_hash_only() {
+        // KGC_TAB: narray=0, nhash=1. Hash = { Str("k"): Num(1.5) }
+        // (covers the KTAB_STR and KTAB_NUM ktabk variants).
+        let mut kgc = vec![0x01, 0x00, 0x01]; // tag, narray=0, nhash=1
+        kgc.extend(ktabk_str(b"k")); // key
+        kgc.extend(ktabk_num(1.5)); // value
+        let pdata = stripped_pdata(1, &kgc, 0, &[], &[]);
+        let proto = parse_one_stripped(&pdata);
+        let tab = match &proto.gc_consts[0] {
+            GcConst::Tab(t) => t,
+            other => panic!("expected GcConst::Tab, got {:?}", other),
+        };
+        assert!(tab.array.is_empty(), "array part should be empty");
+        assert_eq!(tab.hash.len(), 1);
+        match (&tab.hash[0].0, &tab.hash[0].1) {
+            (KtabK::Str(k), KtabK::Num(v)) => {
+                assert_eq!(k, b"k");
+                assert_eq!(*v, 1.5);
+            }
+            other => panic!("hash entry shape mismatch: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_kgc_tab_array_and_hash() {
+        // KGC_TAB: narray=1, nhash=1. Array = [False]; hash = { Int(1): Str("v") }
+        // (covers the KTAB_FALSE, KTAB_INT, and KTAB_STR ktabk variants).
+        let mut kgc = vec![0x01, 0x01, 0x01]; // tag, narray=1, nhash=1
+        kgc.extend(ktabk_false()); // array[0]
+        kgc.extend(ktabk_int(1)); // hash key
+        kgc.extend(ktabk_str(b"v")); // hash value
+        let pdata = stripped_pdata(1, &kgc, 0, &[], &[]);
+        let proto = parse_one_stripped(&pdata);
+        let tab = match &proto.gc_consts[0] {
+            GcConst::Tab(t) => t,
+            other => panic!("expected GcConst::Tab, got {:?}", other),
+        };
+        assert_eq!(tab.array.len(), 1);
+        assert!(matches!(tab.array[0], KtabK::False));
+        assert_eq!(tab.hash.len(), 1);
+        match (&tab.hash[0].0, &tab.hash[0].1) {
+            (KtabK::Int(k), KtabK::Str(v)) => {
+                assert_eq!(*k, 1);
+                assert_eq!(v, b"v");
+            }
+            other => panic!("hash entry shape mismatch: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_kgc_i64() {
+        // KGC_I64 (tag 2): lo ULEB + hi ULEB. value = lo | (hi << 32).
+        // Pick lo=1, hi=2 -> value = 0x2_0000_0001.
+        let mut kgc = vec![0x02];
+        kgc.extend(uleb128_bytes(1)); // lo
+        kgc.extend(uleb128_bytes(2)); // hi
+        let pdata = stripped_pdata(1, &kgc, 0, &[], &[]);
+        let proto = parse_one_stripped(&pdata);
+        match &proto.gc_consts[0] {
+            GcConst::I64(v) => assert_eq!(*v, 0x2_0000_0001),
+            other => panic!("expected GcConst::I64, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_kgc_u64() {
+        // KGC_U64 (tag 3): lo ULEB + hi ULEB. lo=0, hi=1 -> value = 0x1_0000_0000.
+        let mut kgc = vec![0x03];
+        kgc.extend(uleb128_bytes(0)); // lo
+        kgc.extend(uleb128_bytes(1)); // hi
+        let pdata = stripped_pdata(1, &kgc, 0, &[], &[]);
+        let proto = parse_one_stripped(&pdata);
+        match &proto.gc_consts[0] {
+            GcConst::U64(v) => assert_eq!(*v, 0x1_0000_0000),
+            other => panic!("expected GcConst::U64, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_kgc_complex() {
+        // KGC_COMPLEX (tag 4): rlo rhi ilo ihi, each ULEB. real/imag
+        // are IEEE-754 doubles reassembled as (hi << 32) | lo.
+        let real = 1.5_f64;
+        let imag = -2.25_f64;
+        let rbits = real.to_bits();
+        let ibits = imag.to_bits();
+        let mut kgc = vec![0x04];
+        kgc.extend(uleb128_bytes(rbits as u32));
+        kgc.extend(uleb128_bytes((rbits >> 32) as u32));
+        kgc.extend(uleb128_bytes(ibits as u32));
+        kgc.extend(uleb128_bytes((ibits >> 32) as u32));
+        let pdata = stripped_pdata(1, &kgc, 0, &[], &[]);
+        let proto = parse_one_stripped(&pdata);
+        match &proto.gc_consts[0] {
+            GcConst::Complex { real: r, imag: i } => {
+                assert_eq!(*r, real);
+                assert_eq!(*i, imag);
+            }
+            other => panic!("expected GcConst::Complex, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_kgc_str() {
+        // KGC_STR (tag >= 5): string of length (tag - 5).
+        let kgc = ktabk_str(b"hello"); // tag = 5 + 5 = 10
+        let pdata = stripped_pdata(1, &kgc, 0, &[], &[]);
+        let proto = parse_one_stripped(&pdata);
+        match &proto.gc_consts[0] {
+            GcConst::Str(b) => assert_eq!(b, b"hello"),
+            other => panic!("expected GcConst::Str, got {:?}", other),
+        }
+    }
+
+    // ---- Number-constant coverage (format doc §6.3) -----------------
+
+    #[test]
+    fn parses_int_constants_positive_and_negative() {
+        // Three integer constants via the 33-bit ULEB128 (tag=0):
+        //   42 (small positive), -1 (all bits set), -1000.
+        // Verified sign-extension: NumConst::Int(val as i32).
+        let mut kn = Vec::new();
+        kn.extend(uleb128_33_bytes(42, 0));
+        kn.extend(uleb128_33_bytes(0xFFFF_FFFF, 0)); // -1 as u32
+        kn.extend(uleb128_33_bytes((-1000i32) as u32, 0));
+        let pdata = stripped_pdata(0, &[], 3, &kn, &[]);
+        let proto = parse_one_stripped(&pdata);
+        assert_eq!(proto.num_consts.len(), 3);
+        match proto.num_consts[0] {
+            NumConst::Int(v) => assert_eq!(v, 42),
+            other => panic!("expected NumConst::Int(42), got {:?}", other),
+        }
+        match proto.num_consts[1] {
+            NumConst::Int(v) => assert_eq!(v, -1),
+            other => panic!("expected NumConst::Int(-1), got {:?}", other),
+        }
+        match proto.num_consts[2] {
+            NumConst::Int(v) => assert_eq!(v, -1000),
+            other => panic!("expected NumConst::Int(-1000), got {:?}", other),
+        }
+    }
+
+    // ---- Multi-proto dump with named locals --------------------------
+
+    #[test]
+    fn parses_multi_proto_dump_with_named_locals() {
+        // A non-stripped dump with two protos in children-first order:
+        //   proto 1: a simple child (1 RET0, no debug, sizedbg=0).
+        //   proto 2: the main chunk (PROTO_CHILD flag, 1 KGC_CHILD gc
+        //            constant, debug section with a parameter "a" and a
+        //            named local "x").
+        //
+        // The main chunk must be the LAST proto in the vector.
+        //
+        // Layout per format doc §3: phead (flags, numparams, framesize,
+        // numuv) + 3 ULEBs (numkgc, numkn, numbc) + [if !strip:
+        // sizedbg, [if >0: firstline, numline]] + bcins + uvdata + kgc
+        // + kn + [if sizedbg>0: debug section].
+
+        // --- child proto pdata ---
+        let mut pdata_child = Vec::new();
+        pdata_child.extend_from_slice(&[0x00, 0x00, 0x01, 0x00]); // flags=0, params=0, framesize=1, numuv=0
+        pdata_child.extend_from_slice(&[0x00, 0x00, 0x01]); // numkgc=0, numkn=0, numbc=1
+        pdata_child.push(0x00); // sizedbg=0 (no debug section)
+        pdata_child.extend_from_slice(&[0x4b, 0x00, 0x01, 0x00]); // RET0 A=0 D=1
+
+        // --- main proto pdata ---
+        // Debug section first, so sizedbg can be computed exactly:
+        //   line_info: numbc=1 entries, numline=1 (<256) -> 1 byte each.
+        //     entry[0] = delta 0.
+        //   upvalue names: numuv=0 -> nothing.
+        //   var_info:
+        //     parameter "a": type='a' 0x00(empty cstring) scope_delta=0 scopeEnd_raw=5
+        //     local "x":     type='x' 0x00                   scope_delta=3 len=2
+        //     terminator 0x00
+        let mut debug = Vec::new();
+        debug.push(0x00); // line_info[0] = 0
+        debug.extend_from_slice(&[0x61, 0x00, 0x00, 0x05]); // parameter "a"
+        debug.extend_from_slice(&[0x78, 0x00, 0x03, 0x02]); // local "x"
+        debug.push(0x00); // var-info terminator
+        let sizedbg = debug.len();
+
+        let mut pdata_main = Vec::new();
+        pdata_main.extend_from_slice(&[PROTO_CHILD, 0x01, 0x02, 0x00]); // flags, numparams=1, framesize=2, numuv=0
+        pdata_main.extend_from_slice(&[0x01, 0x00, 0x01]); // numkgc=1, numkn=0, numbc=1
+        pdata_main.extend(uleb128_bytes(sizedbg as u32)); // sizedbg
+        pdata_main.extend_from_slice(&[0x01, 0x01]); // firstline=1, numline=1
+        pdata_main.extend_from_slice(&[0x4b, 0x00, 0x01, 0x00]); // RET0 A=0 D=1
+                                                                 // (no uvdata)
+        pdata_main.push(0x00); // kgc: 1 x KGC_CHILD
+                               // (no kn)
+        pdata_main.extend_from_slice(&debug);
+
+        // --- assemble the full non-stripped dump ---
+        let mut dump = Vec::new();
+        dump.extend_from_slice(&[0x1b, 0x4c, 0x4a, 0x02]); // magic + version
+        dump.push(0x00); // flags ULEB = 0 (not stripped, LE)
+        let chunkname = b"@test";
+        dump.push(chunkname.len() as u8); // namelen ULEB
+        dump.extend_from_slice(chunkname);
+        // child proto (children-first).
+        dump.extend(uleb128_bytes(pdata_child.len() as u32));
+        dump.extend_from_slice(&pdata_child);
+        // main proto (last).
+        dump.extend(uleb128_bytes(pdata_main.len() as u32));
+        dump.extend_from_slice(&pdata_main);
+        dump.push(0x00); // dump terminator
+
+        let module = Module::from_bytes(&dump).expect("multi-proto dump should parse");
+
+        // Both protos parsed; main chunk is last.
+        assert_eq!(module.protos.len(), 2, "expected exactly two protos");
+        assert!(std::ptr::eq(module.main_proto(), &module.protos[1]));
+
+        // Main chunk carries PROTO_CHILD and the KGC_CHILD constant.
+        let main = module.main_proto();
+        assert!(
+            main.flags & PROTO_CHILD != 0,
+            "main chunk should have PROTO_CHILD set"
+        );
+        assert_eq!(main.gc_consts.len(), 1);
+        assert!(matches!(main.gc_consts[0], GcConst::Child));
+
+        // Debug info present with a parameter record and a named local.
+        let debug = main
+            .debug
+            .as_ref()
+            .expect("main chunk should carry debug info");
+        let has_param = debug
+            .var_info
+            .iter()
+            .any(|v| v.is_parameter && v.name.as_deref() == Some("a"));
+        assert!(
+            has_param,
+            "expected a parameter named \"a\", got {:?}",
+            debug.var_info
+        );
+        let has_local_x = debug
+            .var_info
+            .iter()
+            .any(|v| !v.is_parameter && v.name.as_deref() == Some("x"));
+        assert!(
+            has_local_x,
+            "expected a named local \"x\", got {:?}",
+            debug.var_info
+        );
     }
 }
