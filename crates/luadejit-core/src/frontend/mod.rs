@@ -1,4 +1,5 @@
-//! Frontend: parse LuaJIT 2.x bytecode into a [`Module`].
+//! Frontend: parse LuaJIT 2.x bytecode into a [`Module`] (defined in
+//! [`crate::ir`]).
 //!
 //! The parser follows the format doc
 //! (`docs/luajit-bytecode-format.md`) §1 grammar, §2 header, §3 proto
@@ -7,158 +8,39 @@
 //! checklist. It is capable of decoding any well-formed LuaJIT 2.x
 //! dump; what the rest of the pipeline *does* with a parsed module is
 //! later stages' concern.
+//!
+//! The bytecode-format data types themselves ([`Module`], [`Proto`],
+//! [`Instruction`], [`Opcode`], the constant enums, [`UpvalDesc`],
+//! [`DebugInfo`], [`VarInfo`], and the format flag constants) live in
+//! [`crate::ir`]. This module owns only the parsing logic: the
+//! [`Reader`] cursor, the [`Module::from_bytes`] entry point, the
+//! [`Instruction::read`] single-instruction decoder, and the `parse_*`
+//! free functions.
 
 pub mod reader;
-pub mod types;
 
 pub use reader::Reader;
-pub use types::{GcConst, Instruction, KtabK, NumConst, Opcode, TableConst, UpvalDesc};
 
+// IR types and format flag constants are defined in `crate::ir`; pull
+// in everything the parser references so the bodies below can use the
+// bare names. `FLAG_FFI` / `FLAG_FR2` are not consumed by the parser
+// (they affect later stages), so they are intentionally not imported
+// here — reach them via `crate::ir::` if ever needed.
+use crate::ir::{
+    DebugInfo, GcConst, Instruction, KtabK, Module, ModuleHeader, NumConst, Opcode, Proto,
+    TableConst, UpvalDesc, VarInfo, VarKind,
+};
+use crate::ir::{FLAG_BE, FLAG_STRIP, FLAGS_KNOWN_MASK, PROTO_CHILD, PROTO_FFI, PROTO_VARARG, VAR_STR};
 use crate::DecompilerError;
 
-// ---- Header-level flag constants (format doc §2.1) -------------------
-
-/// `BCDUMP_F_BE`: big-endian byte order. We only support little-endian.
-pub const FLAG_BE: u32 = 0x01;
-/// `BCDUMP_F_STRIP`: debug info stripped (no chunkname, no line/var info).
-pub const FLAG_STRIP: u32 = 0x02;
-/// `BCDUMP_F_FFI`: dump contains FFI cdata constants.
-pub const FLAG_FFI: u32 = 0x04;
-/// `BCDUMP_F_FR2`: 2-slot frame layout. Affects CALL/CALLM operand
-/// interpretation in later stages, not the parsing itself.
-pub const FLAG_FR2: u32 = 0x08;
-/// Mask of all known flag bits. Any bit outside this mask (other than
-/// the internal deterministic bit) makes the dump invalid.
-pub const FLAGS_KNOWN_MASK: u32 = 0x0F;
-
-// ---- Prototype-level flag constants (format doc §3.2) ---------------
-
-/// `PROTO_CHILD`: has nested child prototypes (referenced via FNEW).
-pub const PROTO_CHILD: u8 = 0x01;
-/// `PROTO_VARARG`: vararg function (`...`). Affects which synthetic
-/// FUNC* opcode sits at in-memory slot 0.
-pub const PROTO_VARARG: u8 = 0x02;
-/// `PROTO_FFI`: uses FFI.
-pub const PROTO_FFI: u8 = 0x04;
-
-// ---- Debug section: var-info type tags (format doc §8.1) ------------
-
-/// Threshold at and above which a var-info type byte is treated as the
-/// first character of a string name rather than a special for-loop
-/// tag. Matches the `BC_VAR_STR` constant in the reference parser.
-pub const VAR_STR: u8 = 7;
-
-// ---- Public data types ----------------------------------------------
-
-/// A parsed bytecode module: the file-level header plus every
-/// prototype, in the on-disk (children-first post-order) order. The
-/// main chunk is always the last element of `protos`.
-#[derive(Clone, Debug)]
-pub struct Module {
-    pub header: ModuleHeader,
-    pub protos: Vec<Proto>,
-}
-
-/// File-level header (format doc §2). The chunkname is preserved
-/// verbatim, including its `@`/`=`/binary first-byte prefix.
-#[derive(Clone, Debug)]
-pub struct ModuleHeader {
-    /// Raw header flags (format doc §2.1).
-    pub flags: u32,
-    /// The chunkname, including the `@`/`=` prefix when present.
-    /// `None` when `BCDUMP_F_STRIP` was set.
-    pub chunkname: Option<Vec<u8>>,
-}
-
-impl ModuleHeader {
-    pub fn is_stripped(&self) -> bool {
-        self.flags & FLAG_STRIP != 0
-    }
-    pub fn is_big_endian(&self) -> bool {
-        self.flags & FLAG_BE != 0
-    }
-    pub fn is_fr2(&self) -> bool {
-        self.flags & FLAG_FR2 != 0
-    }
-}
-
-/// A single prototype (function body).
-#[derive(Clone, Debug)]
-pub struct Proto {
-    pub flags: u8,
-    pub numparams: u8,
-    pub framesize: u8,
-    pub upvalues: Vec<UpvalDesc>,
-    pub gc_consts: Vec<GcConst>,
-    pub num_consts: Vec<NumConst>,
-    /// Bytecode instructions including the synthetic FUNC* header at
-    /// index 0 (format doc §3.3: in-memory count is `numbc + 1`).
-    /// Real instructions from disk start at index 1.
-    pub insts: Vec<Instruction>,
-    pub debug: Option<DebugInfo>,
-}
-
-impl Proto {
-    pub fn is_vararg(&self) -> bool {
-        self.flags & PROTO_VARARG != 0
-    }
-}
-
-/// Per-prototype debug info. Present only when `!STRIP` and
-/// per-prototype `sizedbg > 0`.
-#[derive(Clone, Debug, Default)]
-pub struct DebugInfo {
-    /// First source line of the proto (format doc §8).
-    pub firstline: u32,
-    /// Number of source lines spanned by the proto. Determines the
-    /// line-info width when emitted.
-    pub numline: u32,
-    /// Source line per real instruction. Indexed by the on-disk
-    /// instruction index (0 = first real instruction; does NOT
-    /// include the synthetic FUNC* header at in-memory slot 0).
-    /// Recovered from the delta array per format doc §8.
-    pub line_info: Vec<u32>,
-    /// Upvalue names, parallel to `Proto::upvalues`.
-    pub upvalue_names: Vec<String>,
-    /// Variable scope records.
-    pub var_info: Vec<VarInfo>,
-}
-
-/// A variable scope record from the debug section (format doc §8.1).
-#[derive(Clone, Debug)]
-pub struct VarInfo {
-    pub kind: VarKind,
-    /// Source name when `kind == VarKind::Name`; `None` otherwise.
-    pub name: Option<String>,
-    /// Whether this record describes a parameter.
-    pub is_parameter: bool,
-    /// On-disk instruction index where the variable's scope begins.
-    /// For parameters this is conceptually 0.
-    pub scope_begin: u32,
-    /// On-disk instruction index where the variable's scope ends
-    /// (inclusive in LuaJIT's encoding).
-    pub scope_end: u32,
-}
-
-/// The kind tag for a [`VarInfo`] record.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum VarKind {
-    /// A named local variable (the type byte was the first character
-    /// of the name; type byte >= `VAR_STR`).
-    Name,
-    /// For-loop index (`type byte == 1`).
-    ForIdx,
-    /// For-loop stop (`type byte == 2`).
-    ForStop,
-    /// For-loop step (`type byte == 3`).
-    ForStep,
-    /// Generic-for generator (`type byte == 4`).
-    ForGen,
-    /// Generic-for state (`type byte == 5`).
-    ForState,
-    /// Generic-for control (`type byte == 6`).
-    ForCtl,
-}
+// ---- Parsing-only inherent impls for IR types ------------------------
+//
+// `Module` and `Instruction` are defined in `crate::ir` as pure data
+// plus pure-data accessors. Their parsing entry points depend on the
+// [`Reader`] and on the `parse_*` helpers in this module, so those
+// impls live here alongside the rest of the parser. Rust permits
+// inherent impls for a type to be split across modules within the
+// same crate.
 
 impl Module {
     /// Parse a complete bytecode module. See format doc §13 for the
@@ -169,13 +51,28 @@ impl Module {
         let protos = parse_protos(&mut reader, header.flags)?;
         Ok(Module { header, protos })
     }
+}
 
-    /// The main (root) proto. Per format doc §1, the last proto read
-    /// from disk is the main chunk.
-    pub fn main_proto(&self) -> &Proto {
-        self.protos
-            .last()
-            .expect("a well-formed module always has at least one proto")
+impl Instruction {
+    /// Read one 4-byte instruction from the reader. The opcode
+    /// determines whether the remaining two bytes are interpreted as
+    /// (C, B) for ABC or as a little-endian 16-bit D for AD.
+    pub fn read(reader: &mut Reader<'_>) -> Result<Self, DecompilerError> {
+        let raw = reader.read_bytes(4)?;
+        let op_byte = raw[0];
+        let a = raw[1];
+        let op = Opcode::from_byte(op_byte, reader.pos() - 4)?;
+        let (b_or_d, c) = if op.is_abc() {
+            let c = raw[2];
+            let b = raw[3];
+            (u32::from(b), c)
+        } else {
+            let d_lo = u32::from(raw[2]);
+            let d_hi = u32::from(raw[3]);
+            let d = d_lo | (d_hi << 8);
+            (d, 0)
+        };
+        Ok(Instruction { op, a, b_or_d, c })
     }
 }
 

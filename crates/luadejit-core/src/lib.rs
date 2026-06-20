@@ -1,6 +1,6 @@
 //! luadejit-core: LuaJIT bytecode decompiler library.
 //!
-//! The pipeline is: parse bytecode ([`frontend::Module::from_bytes`])
+//! The pipeline is: parse bytecode ([`ir::Module::from_bytes`])
 //! → emit source ([`emit::emit_module`]). Higher-level stages of the
 //! implementation plan (CFG, SSA, structural recovery, etc.) slot in
 //! between these two steps in later work; Stage 1 implements only the
@@ -8,8 +8,9 @@
 
 pub mod emit;
 pub mod frontend;
+pub mod ir;
 
-use frontend::Module;
+use ir::Module;
 
 /// Decompile LuaJIT bytecode bytes into Lua source code.
 ///

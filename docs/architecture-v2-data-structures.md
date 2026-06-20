@@ -215,6 +215,24 @@ stay private.
 
 ### `ir` module (shared types)
 
+The `ir` module is the single source of truth for two categories of
+shared type:
+
+1. **Bytecode-format data types** (the parsed on-disk form): `Module`,
+   `ModuleHeader`, `Proto`, `Instruction`, `Opcode`, `GcConst`,
+   `TableConst`, `KtabK`, `NumConst`, `UpvalDesc`, `DebugInfo`,
+   `VarInfo`, `VarKind`, plus the format flag constants (`FLAG_BE`,
+   `FLAG_STRIP`, `FLAG_FFI`, `FLAG_FR2`, `FLAGS_KNOWN_MASK`,
+   `PROTO_CHILD`, `PROTO_VARARG`, `PROTO_FFI`, `VAR_STR`). These
+   physically live in `ir/mod.rs` and carry only pure-data accessors
+   (e.g. `Module::main_proto`, `Proto::is_vararg`,
+   `ModuleHeader::is_stripped`, `Opcode::is_abc`, `UpvalDesc::is_open`).
+   The parsing logic that *produces* these types lives in `frontend`;
+   later pipeline stages consume them from `ir` directly rather than
+   reaching into `frontend`.
+
+2. **Pipeline-IR identifier newtypes** (used by later stages):
+
 ```rust
 /// SSA name — the fundamental value identifier in the IR.
 /// Cheap to copy (4 bytes), type-safe via the newtype wrapper.
@@ -240,10 +258,16 @@ pub struct UpvalueIndex(pub u32);
 
 ### `frontend` module
 
-Reuses types similar to the current attempt's reader (the bytecode
-format hasn't changed):
+Owns only the parsing logic that turns bytecode bytes into the
+`ir`-level types. It references `ir::Module`, `ir::Proto`,
+`ir::Instruction`, etc.; it does not define those types itself.
+Concretely it owns: the `Reader` cursor, the `Module::from_bytes`
+parser entry point, the `Instruction::read` single-instruction
+decoder, and the `parse_*` free functions. (The bytecode-format types
+themselves, plus their pure-data accessors, live in `ir` — see above.)
 
 ```rust
+// In `ir`:
 pub struct Module {
     pub header: ModuleHeader,
     pub protos: Vec<Proto>,    // children-first post-order; main chunk last
@@ -260,14 +284,15 @@ pub struct Proto {
     pub debug: Option<DebugInfo>,
 }
 
-// (other reader types: ModuleHeader, Instruction, Opcode, GcConst,
-// NumConst, DebugInfo, VarInfo, UpvalDesc — as in current attempt)
+// (other IR types: ModuleHeader, Instruction, Opcode, GcConst,
+// NumConst, DebugInfo, VarInfo, UpvalDesc — also in `ir`)
 ```
 
-Public interface:
+Public interface (the parsing entry point; the impl lives in
+`frontend` even though the type lives in `ir`):
 ```rust
 impl Module {
-    pub fn from_bytes(bytes: &[u8]) -> Result<Module, ReaderError>;
+    pub fn from_bytes(bytes: &[u8]) -> Result<Module, DecompilerError>;
 }
 ```
 
