@@ -4,9 +4,11 @@
 //! → emit source ([`emit::emit_module`]). Higher-level stages of the
 //! implementation plan (CFG, SSA, structural recovery, etc.) slot in
 //! between these two steps in later work. Currently handles the
-//! Stage 1 RET0-only case (empty source) and the Stage 2
-//! `return <const>` case (integer/number/string/bool/nil constants);
-//! anything else returns [`DecompilerError::NotImplemented`].
+//! Stage 1 RET0-only case (empty source), the Stage 2
+//! `return <const>` case (integer/number/string/bool/nil constants),
+//! and the Stage 3 `local x = <const>` case (single local declaration
+//! that may be returned); anything else returns
+//! [`DecompilerError::NotImplemented`].
 
 pub mod emit;
 pub mod frontend;
@@ -16,12 +18,18 @@ use ir::Module;
 
 /// Decompile LuaJIT bytecode bytes into Lua source code.
 ///
-/// Currently handles two shapes of main proto:
+/// Currently handles three shapes of main proto:
 /// - **Stage 1**: a single `RET0` (source was just `return`) →
 ///   emits empty source.
 /// - **Stage 2**: `[<load_const>, RET1 0 2]` where the load is one of
-///   KSHORT/KNUM/KSTR/KPRI → emits `return <const>` for integer,
-///   number, string, bool, and nil constants.
+///   KSHORT/KNUM/KSTR/KPRI and no var_info names the load's target →
+///   emits `return <const>` for integer, number, string, bool, and
+///   nil constants.
+/// - **Stage 3**: same `[<load_const>, RET1 0 2]` (or `[..., RET0]`)
+///   shape, but the debug section's var_info names the load's target
+///   slot as a live local → emits `local x = <const>[; return x]`.
+///   The bytecode is identical to Stage 2's; var_info is the
+///   discriminator.
 ///
 /// Returns [`DecompilerError::NotImplemented`] for any other shape
 /// and [`DecompilerError::InvalidBytecode`] for malformed bytecode.

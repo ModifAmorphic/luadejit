@@ -8,6 +8,14 @@
 //!   opcodes (`KSHORT`, `KNUM`, `KSTR`, `KPRI`) followed by
 //!   `RET1 0 2`. The emitted source is `return <const>` with no
 //!   trailing newline.
+//! - **Stage 3**: handles `local x = <const>` declarations. The key
+//!   insight is that `local x = 5; return x` compiles to the *same*
+//!   real instructions as `return 5` (`KSHORT 0 5; RET1 0 2`); the
+//!   only difference is the debug section's `var_info` naming slot 0
+//!   as "x". When a constant load writes to a slot the debug info
+//!   names as a live local, we emit `local x = <const>; return x`
+//!   (or just `local x = <const>` when the implicit return is
+//!   `RET0`). The debug info is the discriminator.
 //!
 //! Every other input returns [`DecompilerError::NotImplemented`] —
 //! the pipeline grows into more cases in later stages.
@@ -31,9 +39,24 @@ pub fn emit_module(module: &Module) -> Result<String, DecompilerError> {
         return Ok(String::new());
     }
 
-    // Stage 2: [load_const, RET1 0 2] -> "return <const>".
-    if real_insts.len() == 2 && real_insts[1].op == Opcode::Ret1 {
-        return emit_return_const(main, &real_insts[0], &real_insts[1]);
+    // Stage 2/3: exactly 2 real instructions = a constant load
+    // followed by a return.
+    if real_insts.len() == 2 {
+        let load = &real_insts[0];
+        let ret = &real_insts[1];
+
+        // Stage 3: if the load target is a named local at instruction
+        // 0, the chunk is `local x = <const>[; return x]` rather than
+        // `return <const>`. The bytecode is identical to Stage 2's;
+        // var_info is the discriminator.
+        if let Some(name) = main.var_name_at(load.a, 0) {
+            return emit_local_declaration(main, load, ret, name);
+        }
+
+        // Stage 2: transient const loaded into r0 and returned.
+        if ret.op == Opcode::Ret1 {
+            return emit_return_const(main, load, ret);
+        }
     }
 
     Err(DecompilerError::NotImplemented)
@@ -64,6 +87,41 @@ fn emit_return_const(
     }
     let expr = const_load_expr(proto, load)?;
     Ok(format!("return {}", expr))
+}
+
+/// Emit a `local <name> = <const>` chunk. `load` is the constant-load
+/// instruction that initializes the local; `ret` is the following
+/// return instruction (either `RET0` for an implicit return at end of
+/// chunk, or `RET1 <slot> 2` for an explicit `return <name>`).
+///
+/// We enforce the exact return shape and bail with
+/// [`DecompilerError::NotImplemented`] for anything else — other
+/// shapes (multiple returns, partial returns, etc.) belong to later
+/// stages.
+fn emit_local_declaration(
+    proto: &Proto,
+    load: &Instruction,
+    ret: &Instruction,
+    name: &str,
+) -> Result<String, DecompilerError> {
+    let expr = const_load_expr(proto, load)?;
+    match ret.op {
+        Opcode::Ret0 => {
+            // `local x = <const>` with implicit return at end of chunk.
+            Ok(format!("local {} = {}", name, expr))
+        }
+        Opcode::Ret1 => {
+            // RET1 must read the same slot the load wrote, with D=2.
+            if ret.a != load.a || ret.d() != 2 {
+                return Err(DecompilerError::NotImplemented);
+            }
+            // `local x = <const>\nreturn x`. The `\n` is an internal
+            // statement separator; there is no trailing newline
+            // (consistent with Stages 1-2).
+            Ok(format!("local {} = {}\nreturn {}", name, expr, name))
+        }
+        _ => Err(DecompilerError::NotImplemented),
+    }
 }
 
 /// Render the source expression produced by a constant-load
@@ -419,5 +477,211 @@ mod tests {
             "expected NotImplemented, got {:?}",
             result
         );
+    }
+
+    // ---- Stage 3: `local x = <const>` declarations -------------------
+    //
+    // These mirror the Stage 2 unit tests but with a var_info record
+    // naming the load's target slot. The bytecode shape is identical
+    // to Stage 2's — only the debug section differs, which is exactly
+    // the discriminator `emit_module` consults via `Proto::var_name_at`.
+
+    /// Build a `VarInfo` record naming `slot` as `name` with a scope
+    /// covering real instructions `begin..=end` (inclusive). This
+    /// mirrors what the parser would produce for `local x = <const>`.
+    fn named_local(slot: u8, name: &str, begin: u32, end: u32) -> crate::ir::VarInfo {
+        crate::ir::VarInfo {
+            kind: crate::ir::VarKind::Name,
+            name: Some(name.to_string()),
+            is_parameter: false,
+            slot,
+            scope_begin: begin,
+            scope_end: end,
+        }
+    }
+
+    /// Build a Stage 3 module: a constant `load` into slot 0 named
+    /// `name` (via var_info) followed by `ret`. The caller supplies
+    /// the load instruction, the return instruction, and any constant
+    /// tables the load resolves against.
+    fn local_module(
+        load: Instruction,
+        ret: Instruction,
+        name: &str,
+        gc_consts: Vec<GcConst>,
+        num_consts: Vec<NumConst>,
+    ) -> Module {
+        Module {
+            header: ModuleHeader {
+                flags: 0,
+                chunkname: None,
+            },
+            protos: vec![Proto {
+                flags: 0,
+                numparams: 0,
+                framesize: 1,
+                upvalues: Vec::<UpvalDesc>::new(),
+                gc_consts,
+                num_consts,
+                insts: vec![Instruction::synthetic_header(Opcode::Funcv, 1), load, ret],
+                debug: Some(DebugInfo {
+                    var_info: vec![named_local(0, name, 0, 1)],
+                    ..DebugInfo::default()
+                }),
+            }],
+        }
+    }
+
+    #[test]
+    fn emit_local_int() {
+        // `local x = 5; return x`: KSHORT 0 5; RET1 0 2 with var_info.
+        let load = Instruction {
+            op: Opcode::Kshort,
+            a: 0,
+            b_or_d: 5,
+            c: 0,
+        };
+        let ret = Instruction {
+            op: Opcode::Ret1,
+            a: 0,
+            b_or_d: 2,
+            c: 0,
+        };
+        let module = local_module(load, ret, "x", Vec::new(), Vec::new());
+        assert_eq!(emit_module(&module).unwrap(), "local x = 5\nreturn x");
+    }
+
+    #[test]
+    fn emit_local_no_return() {
+        // `local x = 5` with implicit return: KSHORT 0 5; RET0 0 1.
+        // The local's scope covers only instruction 0 (the load); the
+        // RET0 is the implicit end-of-chunk return.
+        let load = Instruction {
+            op: Opcode::Kshort,
+            a: 0,
+            b_or_d: 5,
+            c: 0,
+        };
+        let ret = Instruction {
+            op: Opcode::Ret0,
+            a: 0,
+            b_or_d: 1,
+            c: 0,
+        };
+        // Scope covers both instructions so var_name_at(load.a, 0)
+        // still resolves — matches the real luajit output, which has
+        // the local live through the RET0.
+        let module = Module {
+            header: ModuleHeader {
+                flags: 0,
+                chunkname: None,
+            },
+            protos: vec![Proto {
+                flags: 0,
+                numparams: 0,
+                framesize: 1,
+                upvalues: Vec::<UpvalDesc>::new(),
+                gc_consts: Vec::new(),
+                num_consts: Vec::new(),
+                insts: vec![Instruction::synthetic_header(Opcode::Funcv, 1), load, ret],
+                debug: Some(DebugInfo {
+                    var_info: vec![named_local(0, "x", 0, 1)],
+                    ..DebugInfo::default()
+                }),
+            }],
+        };
+        assert_eq!(emit_module(&module).unwrap(), "local x = 5");
+    }
+
+    #[test]
+    fn emit_local_str() {
+        // `local x = "foo"; return x`: KSTR 0 0; RET1 0 2 with var_info.
+        let load = Instruction {
+            op: Opcode::Kstr,
+            a: 0,
+            b_or_d: 0,
+            c: 0,
+        };
+        let ret = Instruction {
+            op: Opcode::Ret1,
+            a: 0,
+            b_or_d: 2,
+            c: 0,
+        };
+        let module = local_module(
+            load,
+            ret,
+            "x",
+            vec![GcConst::Str(b"foo".to_vec())],
+            Vec::new(),
+        );
+        assert_eq!(emit_module(&module).unwrap(), "local x = \"foo\"\nreturn x");
+    }
+
+    #[test]
+    fn emit_local_with_ret1_wrong_slot() {
+        // var_info names slot 0, but RET1 reads slot 1 — the return
+        // doesn't read the declared local, so this isn't the
+        // `local x = <const>; return x` shape.
+        let load = Instruction {
+            op: Opcode::Kshort,
+            a: 0,
+            b_or_d: 5,
+            c: 0,
+        };
+        let ret = Instruction {
+            op: Opcode::Ret1,
+            a: 1, // wrong slot
+            b_or_d: 2,
+            c: 0,
+        };
+        let module = local_module(load, ret, "x", Vec::new(), Vec::new());
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for RET1 reading wrong slot, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn emit_local_with_ret1_wrong_d() {
+        // RET1 D != 2 — not the single-value-return convention.
+        let load = Instruction {
+            op: Opcode::Kshort,
+            a: 0,
+            b_or_d: 5,
+            c: 0,
+        };
+        let ret = Instruction {
+            op: Opcode::Ret1,
+            a: 0,
+            b_or_d: 3, // wrong D
+            c: 0,
+        };
+        let module = local_module(load, ret, "x", Vec::new(), Vec::new());
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for RET1 with wrong D, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn emit_stage2_return_const_with_empty_var_info_still_works() {
+        // Regression: a Stage 2 module built without var_info must
+        // still take the `return <const>` path, NOT be mistaken for a
+        // local declaration. The `return_const_module` helper builds
+        // protos with `DebugInfo::default()` (empty var_info), so
+        // `var_name_at` returns None.
+        let load = Instruction {
+            op: Opcode::Kshort,
+            a: 0,
+            b_or_d: 5,
+            c: 0,
+        };
+        let module = return_const_module(load, Vec::new(), Vec::new());
+        assert_eq!(emit_module(&module).unwrap(), "return 5");
     }
 }
