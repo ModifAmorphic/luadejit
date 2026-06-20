@@ -19,8 +19,14 @@
 //! - **Stage 4**: handles single binary arithmetic expressions whose
 //!   result is returned (`Addvn`/`Addnv`/`Addvv` and the `Sub`/`Mul`/
 //!   `Div`/`Mod` variants, plus `Pow` and `Cat`). The walk records the
-//!   expression string for the destination slot without emitting a
-//!   line; `RET1` then surfaces the expression as the returned value.
+//!   expression string for the destination slot; `RET1` then surfaces
+//!   the expression as the returned value.
+//! - **Stage 5**: handles multi-statement sequences. The Stage 4 walk
+//!   already covered most of this — the two gaps closed here are (a)
+//!   arithmetic instructions whose destination slot has a named local
+//!   now emit `local <name> = <expr>` (and store the name for later
+//!   reference), and (b) `MOV A D` is supported (copies slot D's
+//!   expression into slot A, with the same named-local handling).
 //!
 //! Every other input returns [`DecompilerError::NotImplemented`] —
 //! the pipeline grows into more cases in later stages.
@@ -35,9 +41,10 @@ use crate::DecompilerError;
 ///
 /// Walks the main proto's real instructions in order, threading a
 /// `slot_exprs` map (register slot → the source expression currently
-/// occupying it). Constant-load opcodes may also emit a `local`
-/// declaration when the debug info names their target slot. `RET0`
-/// terminates the chunk (possibly with no emitted statements);
+/// occupying it). Constant-load opcodes, arithmetic opcodes, and `MOV`
+/// may all emit a `local` declaration when the debug info names their
+/// target slot — the [`assign_slot`] helper centralizes that decision.
+/// `RET0` terminates the chunk (possibly with no emitted statements);
 /// `RET1` materializes one slot's expression as the return value.
 /// Any opcode not yet handled, or any shape we can't model, returns
 /// [`DecompilerError::NotImplemented`].
@@ -82,24 +89,18 @@ pub fn emit_module(module: &Module) -> Result<String, DecompilerError> {
                 // Stage 3 discriminator: if the debug section names
                 // this slot as a live local at this instruction, the
                 // load is a `local <name> = <expr>` declaration rather
-                // than a transient write. We emit the line AND record
-                // the *name* (not the expression) under the slot, so a
-                // later `return <name>` references the local.
-                if let Some(name) = main.var_name_at(inst.a, idx) {
-                    lines.push(format!("local {} = {}", name, expr));
-                    slot_exprs.insert(inst.a, name.to_string());
-                } else {
-                    slot_exprs.insert(inst.a, expr);
-                }
+                // than a transient write. `assign_slot` handles both
+                // paths (emit + store name, or store as temp).
+                assign_slot(main, &mut slot_exprs, &mut lines, inst.a, expr, idx);
             }
             // ---- Stage 4 binary arithmetic ----------------------------
             //
-            // Arithmetic opcodes write the result to a temporary
-            // (unnamed) slot. We record the expression string under
-            // the destination slot but DO NOT emit a line — the
-            // expression only surfaces when RET1 reads the slot. This
-            // matches the load case's "named local" path's
-            // bookkeeping but skips the `lines.push`.
+            // Arithmetic opcodes write the result to a slot. As with
+            // loads, if that slot has a named local at this
+            // instruction (Stage 5), we emit a `local <name> = <expr>`
+            // declaration and store the name; otherwise the expression
+            // is recorded as an unnamed temporary that surfaces only
+            // when RET1 reads the slot. `assign_slot` handles both.
             //
             // Known limitation: nested arithmetic expressions are
             // emitted without parenthesization. This works whenever
@@ -114,28 +115,22 @@ pub fn emit_module(module: &Module) -> Result<String, DecompilerError> {
             Opcode::Addvn | Opcode::Subvn | Opcode::Mulvn | Opcode::Divvn | Opcode::Modvn => {
                 let left = lookup_operand(&slot_exprs, inst.b())?;
                 let right = format_num_const(&main.num_consts, inst.c as usize)?;
-                slot_exprs.insert(
-                    inst.a,
-                    format!("{} {} {}", left, arith_symbol(inst.op), right),
-                );
+                let expr = format!("{} {} {}", left, arith_symbol(inst.op), right);
+                assign_slot(main, &mut slot_exprs, &mut lines, inst.a, expr, idx);
             }
             // NV: left = num_const[B], right = reg[C].
             Opcode::Addnv | Opcode::Subnv | Opcode::Mulnv | Opcode::Divnv | Opcode::Modnv => {
                 let left = format_num_const(&main.num_consts, inst.b() as usize)?;
                 let right = lookup_operand(&slot_exprs, inst.c)?;
-                slot_exprs.insert(
-                    inst.a,
-                    format!("{} {} {}", left, arith_symbol(inst.op), right),
-                );
+                let expr = format!("{} {} {}", left, arith_symbol(inst.op), right);
+                assign_slot(main, &mut slot_exprs, &mut lines, inst.a, expr, idx);
             }
             // VV: left = reg[B], right = reg[C].
             Opcode::Addvv | Opcode::Subvv | Opcode::Mulvv | Opcode::Divvv | Opcode::Modvv => {
                 let left = lookup_operand(&slot_exprs, inst.b())?;
                 let right = lookup_operand(&slot_exprs, inst.c)?;
-                slot_exprs.insert(
-                    inst.a,
-                    format!("{} {} {}", left, arith_symbol(inst.op), right),
-                );
+                let expr = format!("{} {} {}", left, arith_symbol(inst.op), right);
+                assign_slot(main, &mut slot_exprs, &mut lines, inst.a, expr, idx);
             }
             Opcode::Pow => {
                 // POW has no VN/NV variants — both operands are
@@ -144,7 +139,8 @@ pub fn emit_module(module: &Module) -> Result<String, DecompilerError> {
                 // operator is fixed (`^`) rather than looked up.
                 let left = lookup_operand(&slot_exprs, inst.b())?;
                 let right = lookup_operand(&slot_exprs, inst.c)?;
-                slot_exprs.insert(inst.a, format!("{} ^ {}", left, right));
+                let expr = format!("{} ^ {}", left, right);
+                assign_slot(main, &mut slot_exprs, &mut lines, inst.a, expr, idx);
             }
             Opcode::Cat => {
                 // CAT concatenates regs[B..=C] into A (a range, not
@@ -154,7 +150,23 @@ pub fn emit_module(module: &Module) -> Result<String, DecompilerError> {
                 for slot in inst.b()..=inst.c {
                     parts.push(lookup_operand(&slot_exprs, slot)?);
                 }
-                slot_exprs.insert(inst.a, parts.join(" .. "));
+                let expr = parts.join(" .. ");
+                assign_slot(main, &mut slot_exprs, &mut lines, inst.a, expr, idx);
+            }
+            // ---- Stage 5: MOV A D -----------------------------------
+            //
+            // MOV copies slot D's expression into slot A. The source
+            // must already have a recorded expression (otherwise we've
+            // hit a shape we don't model). MOV is AD format, so the
+            // source register is D; registers are 8-bit, so reading D
+            // as `u8` is correct.
+            Opcode::Mov => {
+                let source_slot = inst.d() as u8;
+                let source_expr = slot_exprs
+                    .get(&source_slot)
+                    .cloned()
+                    .ok_or(DecompilerError::NotImplemented)?;
+                assign_slot(main, &mut slot_exprs, &mut lines, inst.a, source_expr, idx);
             }
             _ => return Err(DecompilerError::NotImplemented),
         }
@@ -176,6 +188,34 @@ fn lookup_operand(slot_exprs: &HashMap<u8, String>, slot: u8) -> Result<String, 
         .get(&slot)
         .cloned()
         .ok_or(DecompilerError::NotImplemented)
+}
+
+/// Record a slot's expression. If the proto's debug section names the
+/// slot as a live local at `inst_index`, emit a `local <name> = <expr>`
+/// declaration and store the *name* under the slot (so a later `return
+/// <name>` references the local). Otherwise, store the expression as
+/// an unnamed temporary that only surfaces when a later instruction
+/// (e.g. `RET1`) reads the slot.
+///
+/// Shared by the constant-load, arithmetic, and `MOV` arms of the walk
+/// — all three share the same "destination slot may or may not be a
+/// named local" bookkeeping. The discriminator is purely the debug
+/// info's [`Proto::var_name_at`]; the bytecode shape is identical
+/// either way.
+fn assign_slot(
+    proto: &Proto,
+    slot_exprs: &mut HashMap<u8, String>,
+    lines: &mut Vec<String>,
+    slot: u8,
+    expr: String,
+    inst_index: usize,
+) {
+    if let Some(name) = proto.var_name_at(slot, inst_index) {
+        lines.push(format!("local {} = {}", name, expr));
+        slot_exprs.insert(slot, name.to_string());
+    } else {
+        slot_exprs.insert(slot, expr);
+    }
 }
 
 /// Map an arithmetic opcode to its Lua source operator. Covers all
@@ -1093,6 +1133,131 @@ mod tests {
             matches!(result, Err(DecompilerError::NotImplemented)),
             "expected NotImplemented for ADDVN with missing num_const, got {:?}",
             result
+        );
+    }
+
+    // ---- Stage 5: named-local arithmetic + MOV ----------------------
+    //
+    // Stage 5 closes two gaps in the walk: arithmetic results that land
+    // in a named-local slot must emit `local <name> = <expr>` (and
+    // store the name), and `MOV A D` copies a slot's expression with
+    // the same named-local handling. The `assign_slot` helper
+    // centralizes both paths.
+
+    #[test]
+    fn emit_named_local_arithmetic() {
+        // `local a = 1; local b = a + 2; return b`:
+        //   KSHORT 0 1; ADDVN 1 0 0; RET1 1 2.
+        // The ADDVN result lands in slot 1, which var_info names "b"
+        // at instruction index 1. Without the named-local check the
+        // walk would record "a + 2" as a temporary and emit
+        // `return a + 2`, dropping the `local b` declaration.
+        let insts = vec![
+            ad(Opcode::Kshort, 0, 1),
+            abc(Opcode::Addvn, 1, 0, 0),
+            ad(Opcode::Ret1, 1, 2),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "a", 0, 2), named_local(1, "b", 1, 2)],
+            Vec::new(),
+            vec![NumConst::Int(2)],
+            2,
+        );
+        assert_eq!(
+            emit_module(&module).unwrap(),
+            "local a = 1\nlocal b = a + 2\nreturn b"
+        );
+    }
+
+    #[test]
+    fn emit_mov_to_named_local() {
+        // `local a = 1; local b = a; return b`:
+        //   KSHORT 0 1; MOV 1 0; RET1 1 2.
+        // MOV is AD format: A=dest, D=source register. The destination
+        // slot 1 is named "b" at instruction 1, so the walk emits a
+        // declaration and stores the name (which RET1 surfaces).
+        let insts = vec![
+            ad(Opcode::Kshort, 0, 1),
+            ad(Opcode::Mov, 1, 0),
+            ad(Opcode::Ret1, 1, 2),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "a", 0, 2), named_local(1, "b", 1, 2)],
+            Vec::new(),
+            Vec::new(),
+            2,
+        );
+        assert_eq!(
+            emit_module(&module).unwrap(),
+            "local a = 1\nlocal b = a\nreturn b"
+        );
+    }
+
+    #[test]
+    fn emit_mov_to_temporary() {
+        // `local a = 5` followed by an unnamed MOV into slot 1 and
+        // RET1 reading slot 1. Slot 1 has NO var_info entry, so the
+        // MOV stores the source's expression ("a") as an unnamed
+        // temporary; no `local` line is emitted. RET1 then surfaces
+        // the temporary expression.
+        let insts = vec![
+            ad(Opcode::Kshort, 0, 5),
+            ad(Opcode::Mov, 1, 0),
+            ad(Opcode::Ret1, 1, 2),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "a", 0, 2)],
+            Vec::new(),
+            Vec::new(),
+            2,
+        );
+        assert_eq!(emit_module(&module).unwrap(), "local a = 5\nreturn a");
+    }
+
+    #[test]
+    fn emit_mov_not_implemented_for_uninitialized_source() {
+        // MOV reads slot 0, but no prior instruction populated it.
+        // The walk bails rather than fabricating an expression.
+        let insts = vec![
+            ad(Opcode::Mov, 1, 0), // slot 0 never written
+            ad(Opcode::Ret1, 1, 2),
+        ];
+        let module = module_with(insts, Vec::new(), Vec::new(), Vec::new(), 2);
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for MOV with uninitialized source, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn emit_arith_unnamed_temporary_preserved_after_assign_slot_refactor() {
+        // Stage 4 regression: `local a = 1; local b = 2; return a + b`
+        // has the ADDVV result land in slot 2, which has NO var_info
+        // entry (no `local c` in the source). `var_name_at(2, 2)`
+        // returns None, so assign_slot stores "a + b" as an unnamed
+        // temporary and emits no line. RET1 surfaces it as a return.
+        // The refactored arithmetic arms must not regress this case.
+        let insts = vec![
+            ad(Opcode::Kshort, 0, 1),
+            ad(Opcode::Kshort, 1, 2),
+            abc(Opcode::Addvv, 2, 0, 1),
+            ad(Opcode::Ret1, 2, 2),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "a", 0, 3), named_local(1, "b", 1, 3)],
+            Vec::new(),
+            Vec::new(),
+            3,
+        );
+        assert_eq!(
+            emit_module(&module).unwrap(),
+            "local a = 1\nlocal b = 2\nreturn a + b"
         );
     }
 
