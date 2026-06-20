@@ -268,7 +268,7 @@ fn parse_proto(reader: &mut Reader<'_>, stripped: bool) -> Result<Proto, Decompi
         let dbg_start = reader.pos();
         let line_info = read_line_info(reader, numbc, firstline, numline)?;
         let upvalue_names = read_upvalue_names(reader, u32::from(numuv))?;
-        let var_info = read_var_info(reader)?;
+        let var_info = read_var_info(reader, numparams)?;
         let consumed = reader.pos() - dbg_start;
         if consumed != sizedbg {
             return Err(DecompilerError::InvalidBytecode {
@@ -466,7 +466,12 @@ fn read_cstring(reader: &mut Reader<'_>) -> Result<String, DecompilerError> {
 /// §8.1). Each record is: a 1-byte type, then a ULEB128 `scope_delta`
 /// applied to a running `scope_offset`, then a parameter-specific or
 /// local-specific ULEB128 to fix up scope begin/end.
-fn read_var_info(reader: &mut Reader<'_>) -> Result<Vec<VarInfo>, DecompilerError> {
+///
+/// `numparams` is the proto's parameter count. It is needed for the
+/// post-pass that computes each record's slot: parameters occupy
+/// slots `0..numparams-1` and locals start at slot `numparams` and
+/// grow via first-fit allocation.
+fn read_var_info(reader: &mut Reader<'_>, numparams: u8) -> Result<Vec<VarInfo>, DecompilerError> {
     let mut records = Vec::new();
     let mut scope_offset: u32 = 0;
     loop {
@@ -526,10 +531,49 @@ fn read_var_info(reader: &mut Reader<'_>) -> Result<Vec<VarInfo>, DecompilerErro
             kind,
             name,
             is_parameter,
+            slot: 0,
             scope_begin,
             scope_end,
         });
     }
+
+    // Post-pass: compute slots via first-fit allocation, mirroring
+    // LuaJIT's register allocator. Parameters are assigned sequential
+    // slots 0, 1, 2, ... in declaration order. Locals start at slot
+    // `numparams` and take the lowest slot not held by any prior
+    // local whose scope overlaps this one — two scopes overlap when
+    // `prev.scope_end >= current.scope_begin` (the previous variable
+    // is still live at the point the new one starts). Slots occupied
+    // by parameters are never reused by locals (parameters are live
+    // for the whole proto).
+    //
+    // The borrow checker forbids reading `records[..i]` from inside
+    // `records.iter_mut()`, so we compute each slot in a separate
+    // pass over indices and assign via direct indexing.
+    let mut next_param_slot = 0u8;
+    for i in 0..records.len() {
+        let slot = if records[i].is_parameter {
+            let s = next_param_slot;
+            next_param_slot += 1;
+            s
+        } else {
+            let mut slot = numparams;
+            loop {
+                let occupied = records[..i].iter().any(|prev| {
+                    !prev.is_parameter
+                        && prev.slot == slot
+                        && prev.scope_end >= records[i].scope_begin
+                });
+                if !occupied {
+                    break;
+                }
+                slot += 1;
+            }
+            slot
+        };
+        records[i].slot = slot;
+    }
+
     Ok(records)
 }
 
@@ -1129,6 +1173,149 @@ mod tests {
             has_local_x,
             "expected a named local \"x\", got {:?}",
             debug.var_info
+        );
+    }
+
+    // ---- Var-info slot allocation (Stage 3) --------------------------
+    //
+    // These tests build non-stripped single-proto dumps with debug
+    // sections and verify that the parser's first-fit slot-allocation
+    // post-pass assigns each local the right register. The slot field
+    // is derived from var_info ordering + scope ranges; it's not on
+    // the wire.
+
+    /// Build a non-stripped dump with one proto carrying the given
+    /// instructions, framesize, and raw debug-section bytes. The
+    /// debug bytes are emitted as-is after the bcins (no uv/kgc/kn),
+    /// and `sizedbg` is computed from their length. `numline` is
+    /// forced small (< 256) so the line-info width is 1 byte/entry —
+    /// the tests construct the delta array explicitly.
+    fn dump_with_debug(
+        framesize: u8,
+        numbc: u32,
+        bcins: &[u8],
+        firstline: u32,
+        numline: u32,
+        line_info: &[u8],
+        var_info_bytes: &[u8],
+    ) -> Vec<u8> {
+        // Assemble the debug section: line_info bytes, then upvalue
+        // names (none here, numuv=0), then var_info bytes.
+        let mut debug = Vec::new();
+        debug.extend_from_slice(line_info);
+        debug.extend_from_slice(var_info_bytes);
+        let sizedbg = debug.len() as u32;
+
+        let mut pdata = Vec::new();
+        // flags=VARARG, numparams=0, framesize, numuv=0.
+        pdata.extend_from_slice(&[0x02, 0x00, framesize, 0x00]);
+        // numkgc=0, numkn=0, numbc.
+        pdata.extend_from_slice(&[0x00, 0x00]);
+        pdata.extend(uleb128_bytes(numbc));
+        // sizedbg.
+        pdata.extend(uleb128_bytes(sizedbg));
+        // firstline, numline.
+        pdata.extend(uleb128_bytes(firstline));
+        pdata.extend(uleb128_bytes(numline));
+        // bcins.
+        pdata.extend_from_slice(bcins);
+        // (no uvdata / kgc / knum)
+        // debug section.
+        pdata.extend_from_slice(&debug);
+
+        make_dump(0x00, Some(b"@slot-test"), &pdata)
+    }
+
+    /// Encode a var-info record for a named local with the given
+    /// scope-delta and length. The record's wire form is:
+    /// `<name_first_byte> <cstring_terminator> <scope_delta ULEB>
+    /// <len ULEB>`. Caller passes the raw scope_delta (the parser
+    /// adds it to a running offset internally).
+    fn var_info_local(name_first: u8, scope_delta: u32, len: u32) -> Vec<u8> {
+        let mut v = vec![name_first, 0x00]; // name char + empty cstring
+        v.extend(uleb128_bytes(scope_delta));
+        v.extend(uleb128_bytes(len));
+        v
+    }
+
+    #[test]
+    fn var_info_slots_assigned_sequentially() {
+        // `local x = 5; local y = 10; return x`:
+        //   bcins: KSHORT 0 5, KSHORT 1 10, RET1 0 2
+        //   var_info: x scope [0,2], y scope [1,2]
+        // Expected slot allocation: x -> 0, y -> 1 (their scopes
+        // overlap, so y can't reuse x's slot).
+        let bcins = [
+            0x29, 0x00, 0x05, 0x00, // KSHORT 0 5
+            0x29, 0x01, 0x0a, 0x00, // KSHORT 1 10
+            0x4c, 0x00, 0x02, 0x00, // RET1 0 2
+        ];
+        let mut var_info = Vec::new();
+        // x: scope_offset 0 -> 2, scope_begin = 0, len 2 -> scope_end 2.
+        var_info.extend(var_info_local(b'x', 2, 2));
+        // y: scope_offset 2 -> 3, scope_begin = 1, len 1 -> scope_end 2.
+        var_info.extend(var_info_local(b'y', 1, 1));
+        var_info.push(0x00); // terminator
+        let dump = dump_with_debug(
+            /*framesize*/ 2,
+            /*numbc*/ 3,
+            &bcins,
+            /*firstline*/ 1,
+            /*numline*/ 2,
+            /*line_info*/ &[0, 0, 0],
+            &var_info,
+        );
+        let module = Module::from_bytes(&dump).expect("dump should parse");
+        let main = module.main_proto();
+        let debug = main.debug.as_ref().expect("debug should be present");
+        assert_eq!(debug.var_info.len(), 2);
+        let x = &debug.var_info[0];
+        assert_eq!(x.name.as_deref(), Some("x"));
+        assert_eq!(x.slot, 0, "x should be at slot 0");
+        let y = &debug.var_info[1];
+        assert_eq!(y.name.as_deref(), Some("y"));
+        assert_eq!(y.slot, 1, "y should be at slot 1 (x still live)");
+    }
+
+    #[test]
+    fn var_info_slots_reused_after_scope_ends() {
+        // `do local a = 1 end do local b = 2 end return`:
+        //   bcins: KSHORT 0 1, KSHORT 0 2, RET0 0 1
+        //   var_info: a scope [0,0], b scope [1,2]
+        // Expected slot allocation: a -> 0, b -> 0 (a's scope ended
+        // before b begins, so the slot is free for reuse).
+        let bcins = [
+            0x29, 0x00, 0x01, 0x00, // KSHORT 0 1
+            0x29, 0x00, 0x02, 0x00, // KSHORT 0 2
+            0x4b, 0x00, 0x01, 0x00, // RET0 0 1
+        ];
+        let mut var_info = Vec::new();
+        // a: scope_offset 0 -> 2, scope_begin = 0, len 0 -> scope_end 0.
+        var_info.extend(var_info_local(b'a', 2, 0));
+        // b: scope_offset 2 -> 3, scope_begin = 1, len 1 -> scope_end 2.
+        var_info.extend(var_info_local(b'b', 1, 1));
+        var_info.push(0x00); // terminator
+        let dump = dump_with_debug(
+            /*framesize*/ 1,
+            /*numbc*/ 3,
+            &bcins,
+            /*firstline*/ 1,
+            /*numline*/ 1,
+            /*line_info*/ &[0, 0, 0],
+            &var_info,
+        );
+        let module = Module::from_bytes(&dump).expect("dump should parse");
+        let main = module.main_proto();
+        let debug = main.debug.as_ref().expect("debug should be present");
+        assert_eq!(debug.var_info.len(), 2);
+        let a = &debug.var_info[0];
+        assert_eq!(a.name.as_deref(), Some("a"));
+        assert_eq!(a.slot, 0, "a should be at slot 0");
+        let b = &debug.var_info[1];
+        assert_eq!(b.name.as_deref(), Some("b"));
+        assert_eq!(
+            b.slot, 0,
+            "b should reuse slot 0 (a's scope ended before b begins)"
         );
     }
 }

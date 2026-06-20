@@ -141,6 +141,35 @@ impl Proto {
             })?;
         Ok(&self.gc_consts[idx])
     }
+
+    /// Look up the source name of the variable occupying `slot` at the
+    /// given real-instruction index (0-based, excluding the synthetic
+    /// FUNC* header). Returns `None` if the proto is stripped, the slot
+    /// has no named local at that instruction, or the slot holds a
+    /// compiler-internal variable (for-loop temporaries have kind !=
+    /// [`VarKind::Name`]).
+    ///
+    /// This is a direct walk of the parsed `DebugInfo.var_info` records
+    /// — a lookup, not a mapping. The full bidirectional DebugMapping
+    /// (SSA name ↔ debug name) is deferred to Stage 7 when SSA renaming
+    /// creates the need to collapse multiple SSA names back to one
+    /// source name.
+    ///
+    /// `inst_index` is indexed the same way as `scope_begin`/`scope_end`
+    /// (see [`DebugInfo::line_info`]): 0 = first real instruction, not
+    /// counting the FUNC* header at in-memory slot 0.
+    pub fn var_name_at(&self, slot: u8, inst_index: usize) -> Option<&str> {
+        let debug = self.debug.as_ref()?;
+        for var in &debug.var_info {
+            if var.slot == slot
+                && var.kind == VarKind::Name
+                && (var.scope_begin as usize..=var.scope_end as usize).contains(&inst_index)
+            {
+                return var.name.as_deref();
+            }
+        }
+        None
+    }
 }
 
 // ---- Instruction types -----------------------------------------------
@@ -501,6 +530,13 @@ pub struct VarInfo {
     pub name: Option<String>,
     /// Whether this record describes a parameter.
     pub is_parameter: bool,
+    /// The register/slot this variable occupies. Computed during
+    /// parsing via first-fit allocation (parameters get sequential
+    /// slots 0..numparams-1; locals get the lowest free slot ≥
+    /// numparams whose previous occupant's scope has ended). Not
+    /// stored in the bytecode format; derived from var_info ordering
+    /// and scope ranges.
+    pub slot: u8,
     /// On-disk instruction index where the variable's scope begins.
     /// For parameters this is conceptually 0.
     pub scope_begin: u32,
@@ -605,5 +641,109 @@ mod tests {
             }
             other => panic!("expected InvalidBytecode, got {:?}", other),
         }
+    }
+
+    // ---- var_name_at (Stage 3 debug-info lookup) ---------------------
+
+    /// Build a `VarInfo` record naming `slot` as `name` with a scope
+    /// covering real instructions `begin..=end` (inclusive).
+    fn named_local(slot: u8, name: &str, begin: u32, end: u32) -> VarInfo {
+        VarInfo {
+            kind: VarKind::Name,
+            name: Some(name.to_string()),
+            is_parameter: false,
+            slot,
+            scope_begin: begin,
+            scope_end: end,
+        }
+    }
+
+    /// Build a stripped proto (no debug info) — the var_name_at
+    /// "stripped" regression case.
+    fn stripped_proto() -> Proto {
+        Proto {
+            flags: 0,
+            numparams: 0,
+            framesize: 0,
+            upvalues: Vec::new(),
+            gc_consts: Vec::new(),
+            num_consts: Vec::new(),
+            insts: Vec::new(),
+            debug: None,
+        }
+    }
+
+    /// Build a proto with a single var_info record: "x" at slot 0
+    /// with scope [0, 1].
+    fn proto_with_local_x() -> Proto {
+        Proto {
+            flags: 0,
+            numparams: 0,
+            framesize: 1,
+            upvalues: Vec::new(),
+            gc_consts: Vec::new(),
+            num_consts: Vec::new(),
+            insts: Vec::new(),
+            debug: Some(DebugInfo {
+                var_info: vec![named_local(0, "x", 0, 1)],
+                ..DebugInfo::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn var_name_at_returns_name_for_in_scope_slot() {
+        let proto = proto_with_local_x();
+        // x is live at slot 0 across instructions 0 and 1.
+        assert_eq!(proto.var_name_at(0, 0), Some("x"));
+        assert_eq!(proto.var_name_at(0, 1), Some("x"));
+    }
+
+    #[test]
+    fn var_name_at_returns_none_for_out_of_scope() {
+        let proto = proto_with_local_x();
+        // Instruction 2 is beyond scope_end (1).
+        assert_eq!(proto.var_name_at(0, 2), None);
+    }
+
+    #[test]
+    fn var_name_at_returns_none_for_wrong_slot() {
+        let proto = proto_with_local_x();
+        // No local at slot 1.
+        assert_eq!(proto.var_name_at(1, 0), None);
+    }
+
+    #[test]
+    fn var_name_at_returns_none_for_stripped() {
+        let proto = stripped_proto();
+        assert_eq!(proto.var_name_at(0, 0), None);
+    }
+
+    #[test]
+    fn var_name_at_skips_for_loop_temporaries() {
+        // A ForIdx record at slot 0 — even though the slot/index
+        // match, kind != VarKind::Name means there's no source name
+        // to return, so we skip it.
+        let proto = Proto {
+            flags: 0,
+            numparams: 0,
+            framesize: 1,
+            upvalues: Vec::new(),
+            gc_consts: Vec::new(),
+            num_consts: Vec::new(),
+            insts: Vec::new(),
+            debug: Some(DebugInfo {
+                var_info: vec![VarInfo {
+                    kind: VarKind::ForIdx,
+                    name: None,
+                    is_parameter: false,
+                    slot: 0,
+                    scope_begin: 0,
+                    scope_end: 5,
+                }],
+                ..DebugInfo::default()
+            }),
+        };
+        assert_eq!(proto.var_name_at(0, 0), None);
     }
 }
