@@ -10,6 +10,7 @@
 //! that may be returned); anything else returns
 //! [`DecompilerError::NotImplemented`].
 
+pub mod cfg;
 pub mod emit;
 pub mod frontend;
 pub mod ir;
