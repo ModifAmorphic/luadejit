@@ -5,14 +5,20 @@
 //! Skips gracefully when the corpus is absent (CI doesn't have it).
 //! The test always passes — it reports success/failure counts but
 //! doesn't assert on individual file outcomes. The value is the
-//! stderr summary: "X of 49 files decompile at Stage 10."
+//! stderr summary: "X of 49 files decompile at Stage N."
+//!
+//! Successful decompilations are written to the output directory
+//! (overwritten each run — no preservation between stages). This lets
+//! you spot-check the decompiled source after each stage.
 
 use std::fs;
 use std::path::PathBuf;
 
-/// Corpus root: the extracted Darktide tree. Resolved against the
-/// home directory so the test works regardless of who runs it.
+/// Corpus root: the extracted Darktide tree.
 const CORPUS_ROOT: &str = "~/repos/ModifAmorphic/sandbox/extract-decompile/extracted";
+
+/// Where to write successful decompilations. Overwritten each run.
+const OUTPUT_DIR: &str = "~/repos/ModifAmorphic/sandbox/extract-decompile/decompiled";
 
 /// Path (relative to the crate) of the v1 file subset list.
 const V1_SUBSET: &str = "tests/corpus/v1.txt";
@@ -37,6 +43,13 @@ fn corpus_regression_v1() {
         .collect();
 
     eprintln!("running corpus regression on {} files", files.len());
+
+    // Clean the output directory so each run starts fresh (no stale
+    // outputs from prior stages).
+    let output_dir = expand_tilde(OUTPUT_DIR);
+    if output_dir.exists() {
+        let _ = fs::remove_dir_all(&output_dir);
+    }
 
     let mut success = 0;
     let mut not_implemented = 0;
@@ -74,8 +87,15 @@ fn corpus_regression_v1() {
         let result = std::panic::catch_unwind(|| luadejit_core::decompile(&bytes));
 
         match result {
-            Ok(Ok(_source)) => {
+            Ok(Ok(source)) => {
                 success += 1;
+                // Write the decompiled source to the output directory,
+                // mirroring the corpus's relative path structure.
+                let out_path = output_dir.join(rel_path);
+                if let Some(parent) = out_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(&out_path, &source);
                 eprintln!("  [{}/{}] SUCCESS: {}", i + 1, files.len(), rel_path);
             }
             Ok(Err(luadejit_core::DecompilerError::NotImplemented)) => {
@@ -110,6 +130,9 @@ fn corpus_regression_v1() {
         panics,
         missing
     );
+    if success > 0 {
+        eprintln!("decompiled outputs written to: {}", output_dir.display());
+    }
 }
 
 /// Expand a leading `~/` to the user's home directory. Paths without
