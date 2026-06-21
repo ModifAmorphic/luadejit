@@ -11,9 +11,9 @@
 //! 3. [`emit_ast`] formats the AST to a source string.
 //!
 //! Linear code (Stages 1-6 shapes) round-trips identically to the
-//! old walk-based emitter; the new capability is `if/then`. Any
-//! CFG shape the recovery doesn't model surfaces as
-//! [`DecompilerError::NotImplemented`].
+//! old walk-based emitter; the new capabilities are `if/then` (Stage
+//! 7) and `if/else` (Stage 8). Any CFG shape the recovery doesn't
+//! model surfaces as [`DecompilerError::NotImplemented`].
 //!
 //! ## Formatting invariants
 //!
@@ -65,10 +65,9 @@ fn emit_ast(stmts: &[Stmt]) -> String {
 
 /// Format one statement at the given indent level. Returns `None`
 /// for `Return(None)` (implicit return — emits no line). `If` nodes
-/// indent their body by one level; the `else_body` slot exists on
-/// the variant for forward-compatibility but Stage 7 recovery never
-/// produces one, so reaching a populated `else_body` here is a
-/// logic bug.
+/// indent their body by one level; an optional `else_body` is
+/// rendered at the same indent as `if`/`end`, with its own
+/// one-level-indented body.
 fn format_stmt(stmt: &Stmt, indent: usize) -> Option<String> {
     let pad = " ".repeat(indent * INDENT_SPACES);
     match stmt {
@@ -83,14 +82,22 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> Option<String> {
             then_body,
             else_body,
         } => {
-            if else_body.is_some() {
-                unreachable!("Stage 7 recovery never emits an else_body; if/else is Stage 8");
-            }
             let mut out = format!("{}if {} then", pad, format_expr(cond));
             for inner in then_body {
                 if let Some(line) = format_stmt(inner, indent + 1) {
                     out.push('\n');
                     out.push_str(&line);
+                }
+            }
+            if let Some(else_stmts) = else_body {
+                out.push('\n');
+                out.push_str(&pad);
+                out.push_str("else");
+                for inner in else_stmts {
+                    if let Some(line) = format_stmt(inner, indent + 1) {
+                        out.push('\n');
+                        out.push_str(&line);
+                    }
                 }
             }
             out.push('\n');
@@ -281,6 +288,38 @@ mod tests {
         assert_eq!(
             format_stmt(&stmt, 0).unwrap(),
             "if x then\n    return 1\nend"
+        );
+    }
+
+    #[test]
+    fn formats_if_else_with_both_bodies_indented() {
+        // Stage 8: populated else_body renders at the same indent as
+        // `if`/`end`, with the else-body indented one level (matching
+        // the then-body).
+        let stmt = Stmt::If {
+            cond: Expr::Global("x".to_string()),
+            then_body: vec![Stmt::Return(Some(Expr::Int(1)))],
+            else_body: Some(vec![Stmt::Return(Some(Expr::Int(2)))]),
+        };
+        assert_eq!(
+            format_stmt(&stmt, 0).unwrap(),
+            "if x then\n    return 1\nelse\n    return 2\nend"
+        );
+    }
+
+    #[test]
+    fn formats_if_else_at_nonzero_indent() {
+        // Inside a nested construct (which Stage 8 doesn't recover,
+        // but the formatter must still handle the AST shape), the
+        // `else` line tracks the outer indent.
+        let stmt = Stmt::If {
+            cond: Expr::Global("y".to_string()),
+            then_body: vec![Stmt::Return(Some(Expr::Int(1)))],
+            else_body: Some(vec![Stmt::Return(Some(Expr::Int(2)))]),
+        };
+        assert_eq!(
+            format_stmt(&stmt, 1).unwrap(),
+            "    if y then\n        return 1\n    else\n        return 2\n    end"
         );
     }
 
