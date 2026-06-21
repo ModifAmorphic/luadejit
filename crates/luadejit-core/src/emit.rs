@@ -105,6 +105,46 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> Option<String> {
             out.push_str("end");
             Some(out)
         }
+        Stmt::For {
+            var,
+            start,
+            stop,
+            step,
+            body,
+        } => {
+            // `for var = start, stop[, step] do` — omit the step
+            // entirely when the recovery collapsed it to None
+            // (default step of 1). Otherwise include it as a third
+            // expression in the header.
+            let header = match step {
+                None => format!(
+                    "{}for {} = {}, {} do",
+                    pad,
+                    var,
+                    format_expr(start),
+                    format_expr(stop)
+                ),
+                Some(s) => format!(
+                    "{}for {} = {}, {}, {} do",
+                    pad,
+                    var,
+                    format_expr(start),
+                    format_expr(stop),
+                    format_expr(s)
+                ),
+            };
+            let mut out = header;
+            for inner in body {
+                if let Some(line) = format_stmt(inner, indent + 1) {
+                    out.push('\n');
+                    out.push_str(&line);
+                }
+            }
+            out.push('\n');
+            out.push_str(&pad);
+            out.push_str("end");
+            Some(out)
+        }
     }
 }
 
@@ -401,6 +441,63 @@ mod tests {
         assert_eq!(
             format_stmt(&inner, 1).unwrap(),
             "    if y then\n        return 2\n    end"
+        );
+    }
+
+    // ---- Stage 10: numeric-for formatting ------------------------------
+
+    #[test]
+    fn formats_for_without_step() {
+        // step == None → omit the third expression in the header.
+        let stmt = Stmt::For {
+            var: "i".to_string(),
+            start: Expr::Int(1),
+            stop: Expr::Int(10),
+            step: None,
+            body: vec![Stmt::LocalDecl {
+                name: "x".to_string(),
+                expr: Expr::Var("i".to_string()),
+            }],
+        };
+        assert_eq!(
+            format_stmt(&stmt, 0).unwrap(),
+            "for i = 1, 10 do\n    local x = i\nend"
+        );
+    }
+
+    #[test]
+    fn formats_for_with_step() {
+        // step == Some(Int(2)) → include as third header expression.
+        let stmt = Stmt::For {
+            var: "i".to_string(),
+            start: Expr::Int(1),
+            stop: Expr::Int(10),
+            step: Some(Expr::Int(2)),
+            body: vec![Stmt::LocalDecl {
+                name: "x".to_string(),
+                expr: Expr::Var("i".to_string()),
+            }],
+        };
+        assert_eq!(
+            format_stmt(&stmt, 0).unwrap(),
+            "for i = 1, 10, 2 do\n    local x = i\nend"
+        );
+    }
+
+    #[test]
+    fn formats_for_at_nonzero_indent() {
+        // Stage 10 doesn't recover nested loops, but the formatter
+        // must still handle the AST shape if it ever appears.
+        let stmt = Stmt::For {
+            var: "i".to_string(),
+            start: Expr::Int(1),
+            stop: Expr::Int(3),
+            step: None,
+            body: vec![Stmt::Return(Some(Expr::Var("i".to_string())))],
+        };
+        assert_eq!(
+            format_stmt(&stmt, 1).unwrap(),
+            "    for i = 1, 3 do\n        return i\n    end"
         );
     }
 

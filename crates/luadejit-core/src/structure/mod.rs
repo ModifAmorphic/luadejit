@@ -54,7 +54,7 @@
 //! because the supported fixtures don't introduce merge-time
 //! conflicts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::cfg::{BlockId, Cfg, InstructionId, Terminator};
 use crate::ir::{GcConst, Instruction, NumConst, Opcode, Proto};
@@ -79,6 +79,15 @@ pub enum Stmt {
         cond: Expr,
         then_body: Vec<Stmt>,
         else_body: Option<Vec<Stmt>>,
+    },
+    /// `for var = start, stop[, step] do body end` (Stage 10). When
+    /// `step` is `None` the source omitted it (default step of 1).
+    For {
+        var: String,
+        start: Expr,
+        stop: Expr,
+        step: Option<Expr>,
+        body: Vec<Stmt>,
     },
 }
 
@@ -198,11 +207,13 @@ pub fn recover(proto: &Proto, cfg: &Cfg) -> Result<Vec<Stmt>, DecompilerError> {
         return Err(DecompilerError::NotImplemented);
     }
     let mut slot_exprs: HashMap<u8, Expr> = HashMap::new();
+    let mut visited: HashSet<BlockId> = HashSet::new();
     let mut stmts = Vec::new();
     let mut ctx = RecoveryCtx {
         proto,
         cfg,
         slot_exprs: &mut slot_exprs,
+        visited: &mut visited,
     };
     recover_from(cfg.entry, false, &mut ctx, &mut stmts)?;
     Ok(stmts)
@@ -298,6 +309,20 @@ struct RecoveryCtx<'a> {
     proto: &'a Proto,
     cfg: &'a Cfg,
     slot_exprs: &'a mut HashMap<u8, Expr>,
+    /// Blocks already entered by some `recover_from` invocation on the
+    /// current recovery walk. Stage 10's safety mechanism: any
+    /// *unexpected* control-flow cycle (one the recovery doesn't
+    /// handle explicitly, e.g. a back-edge that isn't a recognized
+    /// loop pattern) returns [`DecompilerError::NotImplemented`]
+    /// instead of recursing forever.
+    ///
+    /// Recognized loops never re-enter a block via the back-edge
+    /// because the loop-latch arm stops the walk rather than
+    /// following the back-edge. So in normal operation this set
+    /// accumulates every block visited exactly once; the membership
+    /// check only fires on a malformed CFG or a future loop pattern
+    /// the recovery hasn't been taught to short-circuit.
+    visited: &'a mut HashSet<BlockId>,
 }
 
 /// Walk a chain of blocks starting at `start`, appending [`Stmt`]s
@@ -330,6 +355,14 @@ fn recover_from(
     ctx: &mut RecoveryCtx,
     stmts: &mut Vec<Stmt>,
 ) -> Result<BlockId, DecompilerError> {
+    // Visited-block safety net (Stage 10). A block already entered by
+    // some `recover_from` invocation on this walk means we've hit a
+    // control-flow cycle the recovery doesn't handle explicitly.
+    // `HashSet::insert` returns false when the value was already
+    // present, so the negation means "already visited".
+    if !ctx.visited.insert(start) {
+        return Err(DecompilerError::NotImplemented);
+    }
     let mut current = Some(start);
     let mut last_block = start;
     while let Some(block_id) = current {
@@ -536,6 +569,105 @@ fn recover_from(
             Terminator::TailCall(_) => {
                 // Tail calls aren't supported.
                 return Err(DecompilerError::NotImplemented);
+            }
+            Terminator::LoopInit { base, exit, body } => {
+                // Numeric-for loop start. Process the prefix
+                // instructions (start/stop/step loads into slots A,
+                // A+1, A+2), then read the three operands back as
+                // Exprs, look up the loop variable name at slot A+3
+                // (kind=Name in debug info), and recurse into the
+                // body. The body's terminator is `LoopLatch`, which
+                // stops the walk at the back-edge rather than
+                // following it.
+                if stop_at_merge {
+                    // A LoopInit inside a branch body is a loop
+                    // nested in an `if` — Stage 10 doesn't model that.
+                    return Err(DecompilerError::NotImplemented);
+                }
+                // The FORI itself is the trailing instruction; every
+                // earlier instruction in the block is the pre-loop
+                // setup. The FORI initializes slot A+3 implicitly, so
+                // we never `process_inst` it.
+                let last_idx = block.insts.last().map(|id| id.0 as usize).unwrap();
+                for inst_id in &block.insts {
+                    if (inst_id.0 as usize) == last_idx {
+                        break;
+                    }
+                    process_inst(ctx, stmts, *inst_id)?;
+                }
+                // Read the start/stop/step Exprs from the slot map.
+                let start = lookup_operand(ctx.slot_exprs, base)?;
+                let stop = lookup_operand(ctx.slot_exprs, base + 1)?;
+                let step_expr = lookup_operand(ctx.slot_exprs, base + 2)?;
+                // LuaJIT emits an explicit `KSHORT A+2 1` even when
+                // the user wrote no step. Collapse Expr::Int(1) back
+                // to None so emit produces `for i = 1, 10 do` rather
+                // than `for i = 1, 10, 1 do`. Any other step value
+                // (including Expr::Float(1.0)) is preserved verbatim.
+                let step = if step_expr == Expr::Int(1) {
+                    None
+                } else {
+                    Some(step_expr)
+                };
+                // The loop variable name is stored in debug info as a
+                // VarKind::Name record at slot A+3 (verified
+                // empirically: the ForIdx/ForStop/ForStep records
+                // occupy slots A, A+1, A+2 and carry no source name;
+                // the visible loop variable gets its own Name record
+                // at slot A+3). Look it up at the FORI's
+                // real-instruction index — the variable's scope_begin
+                // equals the FORI's real_idx in all observed fixtures.
+                let fori_real_idx = last_idx - 1;
+                let var_name = ctx
+                    .proto
+                    .var_name_at(base + 3, fori_real_idx)
+                    .ok_or(DecompilerError::NotImplemented)?
+                    .to_string();
+                // Make the loop variable visible inside the body:
+                // slot A+3 resolves to `Expr::Var(name)` so a `MOV
+                // dst, A+3` reads as `dst = i`, a `RET1 A+3 2` reads
+                // as `return i`, etc.
+                ctx.slot_exprs.insert(base + 3, Expr::Var(var_name.clone()));
+                // Process the body. The walk follows Fallthroughs
+                // through the body's blocks until it hits the
+                // `LoopLatch` block, where it stops at the back-edge.
+                let mut body_stmts: Vec<Stmt> = Vec::new();
+                recover_from(body, true, ctx, &mut body_stmts)?;
+                stmts.push(Stmt::For {
+                    var: var_name,
+                    start,
+                    stop,
+                    step,
+                    body: body_stmts,
+                });
+                // Continue the outer walk at the loop exit. The
+                // LoopLatch's fall-through and any "dead" LoopLatch
+                // block (unreachable when the body returns) are
+                // skipped: the exit is encoded directly in LoopInit.
+                current = Some(exit);
+            }
+            Terminator::LoopLatch { .. } => {
+                // Loop back-edge terminator (FORL). Process the
+                // prefix instructions (everything except the FORL
+                // itself), then stop without following the back-edge.
+                // The loop body ends here; the FORL's body target is
+                // the body start (already visited by the time we'd
+                // reach the back-edge).
+                //
+                // We only enter a LoopLatch block from inside a loop
+                // body (the LoopInit arm calls `recover_from(body,
+                // ...)`). Encountering one at the top level would
+                // mean a malformed CFG (a FORL without a matching
+                // FORI); the visited check or earlier bail would have
+                // caught it before now.
+                let last_idx = block.insts.last().map(|id| id.0 as usize).unwrap();
+                for inst_id in &block.insts {
+                    if (inst_id.0 as usize) == last_idx {
+                        break;
+                    }
+                    process_inst(ctx, stmts, *inst_id)?;
+                }
+                break;
             }
         }
     }
@@ -1143,7 +1275,7 @@ mod tests {
     //! suite for its formatter (statement/expression → string).
 
     use super::*;
-    use crate::cfg::Cfg;
+    use crate::cfg::{BasicBlock, Cfg};
     use crate::emit::emit_module;
     use crate::ir::{
         DebugInfo, GcConst, Instruction, Module, ModuleHeader, NumConst, Opcode, Proto, UpvalDesc,
@@ -3067,5 +3199,269 @@ mod tests {
             insts: Vec::new(),
             debug: None,
         }
+    }
+
+    // ====================================================================
+    // Stage 10: numeric-for recovery unit tests
+    // ====================================================================
+
+    /// Build a `VarInfo` of the given `VarKind` (no source name) at
+    /// `slot`, scope `[begin..=end]`. Used to populate the
+    /// ForIdx/ForStop/ForStep records LuaJIT emits for the loop's
+    /// internal slots.
+    fn for_loop_var(kind: VarKind, slot: u8, begin: u32, end: u32) -> VarInfo {
+        VarInfo {
+            kind,
+            name: None,
+            is_parameter: false,
+            slot,
+            scope_begin: begin,
+            scope_end: end,
+        }
+    }
+
+    /// Build a Stage-10 module mirroring `for i = 1, 10 do local x = i end`.
+    ///
+    /// Bytecode (abs idx → real idx):
+    ///   1 KSHORT 0 1     real-idx 0  (start)
+    ///   2 KSHORT 1 10    real-idx 1  (stop)
+    ///   3 KSHORT 2 1     real-idx 2  (step)
+    ///   4 FORI 0 => 0007 real-idx 3
+    ///   5 MOV 4 3         real-idx 4  (body: x = i)
+    ///   6 FORL 0 => 0005 real-idx 5
+    ///   7 RET0 0 1        real-idx 6  (exit)
+    ///
+    /// Caller supplies the var_info records so individual tests can
+    /// vary them (e.g., test the missing-name NotImplemented path).
+    fn for_loop_module(var_info: Vec<VarInfo>) -> Module {
+        // FORI at abs idx 4 → target abs idx 7. j = 7 - 5 = 2, D = 0x8002.
+        // FORL at abs idx 6 → target abs idx 5. j = 5 - 7 = -2, D = 0x7ffe.
+        let insts = vec![
+            ad(Opcode::Kshort, 0, 1),
+            ad(Opcode::Kshort, 1, 10),
+            ad(Opcode::Kshort, 2, 1),
+            ad(Opcode::Fori, 0, 0x8002),
+            ad(Opcode::Mov, 4, 3),
+            ad(Opcode::Forl, 0, 0x7ffe),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        module_with(insts, var_info, Vec::new(), Vec::new(), 5)
+    }
+
+    /// The var_info records LuaJIT emits for
+    /// `for i = 1, 10 do local x = i end`. Verified empirically via
+    /// the IR parser. The visible loop variable `i` is a
+    /// `VarKind::Name` at slot A+3 (NOT a ForIdx — ForIdx occupies
+    /// slot A and carries no source name).
+    fn standard_for_loop_var_info() -> Vec<VarInfo> {
+        vec![
+            for_loop_var(VarKind::ForIdx, 0, 2, 5),
+            for_loop_var(VarKind::ForStop, 1, 2, 5),
+            for_loop_var(VarKind::ForStep, 2, 2, 5),
+            named_local(3, "i", 3, 4),
+            named_local(4, "x", 4, 4),
+        ]
+    }
+
+    /// `for i = 1, 10 do local x = i end` → emits the canonical
+    /// source through the full pipeline.
+    #[test]
+    fn recover_numeric_for_simple_body() {
+        let module = for_loop_module(standard_for_loop_var_info());
+        assert_eq!(emit(&module), "for i = 1, 10 do\n    local x = i\nend");
+    }
+
+    /// Same fixture recovered directly to AST (not via emit_module).
+    /// Verifies the `Stmt::For` tree shape: step collapsed to None
+    /// (Expr::Int(1) default), one LocalDecl in the body.
+    #[test]
+    fn recover_numeric_for_ast_shape() {
+        let module = for_loop_module(standard_for_loop_var_info());
+        let proto = module.main_proto();
+        let cfg = Cfg::build(proto);
+        let ast = recover(proto, &cfg).expect("recover should succeed");
+
+        assert_eq!(ast.len(), 1, "expected just [For] (implicit RET0)");
+        match &ast[0] {
+            Stmt::For {
+                var,
+                start,
+                stop,
+                step,
+                body,
+            } => {
+                assert_eq!(var, "i", "var name");
+                assert_eq!(*start, Expr::Int(1), "start");
+                assert_eq!(*stop, Expr::Int(10), "stop");
+                assert_eq!(*step, None, "step should be None for Expr::Int(1)");
+                assert_eq!(body.len(), 1, "body len");
+                match &body[0] {
+                    Stmt::LocalDecl { name, expr } => {
+                        assert_eq!(name, "x");
+                        assert_eq!(*expr, Expr::Var("i".to_string()));
+                    }
+                    other => panic!("expected LocalDecl, got {:?}", other),
+                }
+            }
+            other => panic!("expected For, got {:?}", other),
+        }
+    }
+
+    /// `for i = 1, 10, 2 do local x = i end` → preserves step.
+    /// Reuses `for_loop_module` but overrides the step slot's value
+    /// via post-construction mutation (simpler than threading a
+    /// parameter through).
+    #[test]
+    fn recover_numeric_for_with_step_preserved() {
+        let mut module = for_loop_module(standard_for_loop_var_info());
+        // KSHORT 2 1 (slot 2 = step) is at abs idx 3; change 1 → 2.
+        module.protos[0].insts[3].b_or_d = 2;
+        assert_eq!(emit(&module), "for i = 1, 10, 2 do\n    local x = i\nend");
+
+        // AST: step is Some(Int(2)).
+        let proto = module.main_proto();
+        let cfg = Cfg::build(proto);
+        let ast = recover(proto, &cfg).expect("recover should succeed");
+        match &ast[0] {
+            Stmt::For { step, .. } => {
+                assert_eq!(*step, Some(Expr::Int(2)), "step should be Int(2)");
+            }
+            other => panic!("expected For, got {:?}", other),
+        }
+    }
+
+    /// A loop variable name that the debug info doesn't surface
+    /// (stripped or no Name record at slot A+3) bails with
+    /// NotImplemented rather than guessing.
+    #[test]
+    fn recover_numeric_for_bails_when_var_name_missing() {
+        // Same bytecode as the simple-body fixture, but the var_info
+        // only has the ForIdx/ForStop/ForStep records (no Name for
+        // slot 3 or 4). The recovery can't reconstruct `i`.
+        let var_info = vec![
+            for_loop_var(VarKind::ForIdx, 0, 2, 5),
+            for_loop_var(VarKind::ForStop, 1, 2, 5),
+            for_loop_var(VarKind::ForStep, 2, 2, 5),
+        ];
+        let module = for_loop_module(var_info);
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented when loop var name is missing, got {:?}",
+            result
+        );
+    }
+
+    /// The visited-block safety net fires when `recover_from` is
+    /// called recursively on a block already entered. Construct a
+    /// synthetic CFG whose LoopInit points its `body` edge at itself:
+    /// the LoopInit arm calls `recover_from(body, ...)` which is the
+    /// same block, so the recursive call's visited check fires. This
+    /// is the exact shape that would infinite-recurse without the
+    /// safety net — by the time the recursive call is made, the
+    /// prefix has been processed and the loop variable resolved, so
+    /// nothing else bails first.
+    #[test]
+    fn visited_block_tracking_breaks_unexpected_cycle() {
+        // Proto: KSHORT (start); KSHORT (stop); KSHORT (step); FORI.
+        // The synthetic CFG below rewrites the FORI's body edge to
+        // point at the FORI's own block (Block 0) rather than a
+        // separate body block — creating a self-referential cycle.
+        let proto = Proto {
+            flags: 0x02,
+            numparams: 0,
+            framesize: 4,
+            upvalues: Vec::new(),
+            gc_consts: Vec::new(),
+            num_consts: Vec::new(),
+            insts: vec![
+                Instruction::synthetic_header(Opcode::Funcv, 4),
+                ad(Opcode::Kshort, 0, 1),    // idx 1 — start
+                ad(Opcode::Kshort, 1, 10),   // idx 2 — stop
+                ad(Opcode::Kshort, 2, 1),    // idx 3 — step
+                ad(Opcode::Fori, 0, 0x8002), // idx 4 — FORI (would target idx 7 normally)
+            ],
+            debug: Some(DebugInfo {
+                var_info: vec![named_local(3, "i", 3, 3)],
+                ..DebugInfo::default()
+            }),
+        };
+        // Synthetic CFG: a single block that is its own loop body.
+        // Not a shape the CFG builder would ever produce, but exactly
+        // the kind of unexpected cycle the safety net must catch.
+        let cfg = Cfg {
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    InstructionId(1),
+                    InstructionId(2),
+                    InstructionId(3),
+                    InstructionId(4),
+                ],
+                terminator: Terminator::LoopInit {
+                    base: 0,
+                    exit: BlockId(0),
+                    body: BlockId(0),
+                },
+                preds: vec![BlockId(0)],
+                succs: vec![
+                    (BlockId(0), crate::cfg::EdgeKind::True),
+                    (BlockId(0), crate::cfg::EdgeKind::False),
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        let result = recover(&proto, &cfg);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented on synthetic self-referential LoopInit, got {:?}",
+            result
+        );
+    }
+
+    /// A LoopInit inside a branch body (nested loop in an `if`) is
+    /// not supported in Stage 10 — bails with NotImplemented rather
+    /// than attempting the nested walk.
+    #[test]
+    fn recover_numeric_for_in_branch_body_bails() {
+        // Outer if/then wrapping an inner numeric-for. The walk
+        // enters the then-body with stop_at_merge=true; the LoopInit
+        // arm rejects that immediately.
+        //   GGET 0 0; ISF 0; JMP => 0010;  (entry / outer CB)
+        //   KSHORT 1 1; KSHORT 2 10; KSHORT 3 1;
+        //   FORI 1 => 0009; FORL 1 => 0007;  (inner loop, in then-body)
+        //   RET0.
+        // (Contrived bytecode; the CFG has 1 CB + 1 FORI, the
+        // unsupported nested shape.)
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),      // idx 1
+            ad(Opcode::Isf, 0, 0),       // idx 2
+            ad(Opcode::Jmp, 1, 0x8006),  // idx 3: target = idx 10
+            ad(Opcode::Kshort, 1, 1),    // idx 4
+            ad(Opcode::Kshort, 2, 10),   // idx 5
+            ad(Opcode::Kshort, 3, 1),    // idx 6
+            ad(Opcode::Fori, 1, 0x8001), // idx 7: target = idx 9 (exit)
+            ad(Opcode::Forl, 1, 0x7ffd), // idx 8: target = idx 6 (body)
+            ad(Opcode::Ret0, 0, 1),      // idx 9 (inner exit)
+            ad(Opcode::Ret0, 0, 1),      // idx 10 (outer merge)
+        ];
+        let module = module_with(
+            insts,
+            vec![
+                for_loop_var(VarKind::ForIdx, 1, 5, 8),
+                for_loop_var(VarKind::ForStop, 2, 5, 8),
+                for_loop_var(VarKind::ForStep, 3, 5, 8),
+                named_local(4, "i", 6, 7),
+            ],
+            vec![GcConst::Str(b"x".to_vec())],
+            Vec::new(),
+            5,
+        );
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for nested loop in if-body, got {:?}",
+            result
+        );
     }
 }

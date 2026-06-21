@@ -108,6 +108,35 @@ pub enum Terminator {
     /// Tail call (CALLT, CALLMT) — treated as a return for CFG
     /// purposes. The payload is the CALLT/CALLMT instruction's index.
     TailCall(InstructionId),
+    /// Numeric-for loop initializer (FORI; Stage 10). Initializes the
+    /// loop index slot (A+3) from the start/stop/step values in slots
+    /// A, A+1, A+2. If the loop body would NOT execute (e.g. start >
+    /// stop with positive step), jumps to `exit`; otherwise falls
+    /// through to `body`. Modeled as a conditional branch: the
+    /// true_edge (jump) is `exit`, the false_edge (fall-through) is
+    /// `body`.
+    LoopInit {
+        /// The FORI's base slot A. Slots A..=A+3 hold start, stop,
+        /// step, and the loop index respectively.
+        base: u8,
+        /// Jump target (loop body empty) — the loop exit.
+        exit: BlockId,
+        /// Fall-through target — the loop body start.
+        body: BlockId,
+    },
+    /// Numeric-for loop latch (FORL; Stage 10). Increments the loop
+    /// index by step. If the loop should continue, jumps back to
+    /// `body` (the back-edge); otherwise falls through to `exit`.
+    /// Modeled as a conditional branch: the true_edge (backward jump)
+    /// is `body`, the false_edge (fall-through) is `exit`.
+    LoopLatch {
+        /// The FORL's base slot A (matches the paired FORI's base).
+        base: u8,
+        /// Backward jump target — the loop body start.
+        body: BlockId,
+        /// Fall-through target — the loop exit.
+        exit: BlockId,
+    },
     // Note on UCLO (close upvalues): UCLO can be followed by a JMP or
     // a RET. For Stage 7a we treat UCLO as a regular instruction
     // within its block; the *following* instruction determines the
@@ -227,6 +256,20 @@ impl Cfg {
                 // after the JMP is a leader (the false-edge target
                 // for an ISxx+JMP pair, or unreachable for a
                 // standalone JMP).
+                if let Some(target) = Self::jmp_target(proto, i) {
+                    leaders.insert(target);
+                }
+                if i + 1 < n {
+                    leaders.insert(i + 1);
+                }
+            } else if op == Opcode::Fori || op == Opcode::Forl {
+                // FORI/FORL: like JMP, their D-field target is a
+                // leader, and the instruction after them is a leader
+                // (the fall-through edge). For FORI the D target is
+                // the loop exit and the fall-through is the body; for
+                // FORL the D target is the body (back-edge) and the
+                // fall-through is the exit. Both end a block: the
+                // FORI/FORL instruction is the block's terminator.
                 if let Some(target) = Self::jmp_target(proto, i) {
                     leaders.insert(target);
                 }
@@ -491,6 +534,47 @@ impl Cfg {
                 Terminator::TailCall(InstructionId(last_inst_idx.unwrap() as u32)),
                 Vec::new(),
             ),
+            Some(Opcode::Fori) => {
+                // FORI A D: initializes the loop and conditionally
+                // jumps to the exit (D target). The fall-through is
+                // the loop body. Modeled as a conditional branch:
+                // true_edge (jump) = exit, false_edge (fall-through)
+                // = body.
+                let fori_idx = last_inst_idx.unwrap();
+                let base = proto.insts[fori_idx].a;
+                let exit = Self::jmp_target(proto, fori_idx)
+                    .and_then(|t| leader_to_block.get(&t).copied());
+                let body = next_block_id;
+                match (exit, body) {
+                    (Some(exit), Some(body)) => (
+                        Terminator::LoopInit { base, exit, body },
+                        vec![(exit, EdgeKind::True), (body, EdgeKind::False)],
+                    ),
+                    // Unresolvable target or no fall-through: degenerate.
+                    // Well-formed bytecode always has both. Fall back to
+                    // Return so the CFG stays well-formed.
+                    _ => (Terminator::Return, Vec::new()),
+                }
+            }
+            Some(Opcode::Forl) => {
+                // FORL A D: increments the index and conditionally
+                // jumps back to the body (D target). The fall-through
+                // is the loop exit. Modeled as a conditional branch:
+                // true_edge (backward jump) = body, false_edge
+                // (fall-through) = exit.
+                let forl_idx = last_inst_idx.unwrap();
+                let base = proto.insts[forl_idx].a;
+                let body = Self::jmp_target(proto, forl_idx)
+                    .and_then(|t| leader_to_block.get(&t).copied());
+                let exit = next_block_id;
+                match (body, exit) {
+                    (Some(body), Some(exit)) => (
+                        Terminator::LoopLatch { base, body, exit },
+                        vec![(body, EdgeKind::True), (exit, EdgeKind::False)],
+                    ),
+                    _ => (Terminator::Return, Vec::new()),
+                }
+            }
             Some(Opcode::Jmp) => {
                 let jmp_idx = last_inst_idx.unwrap();
                 let target_block =
@@ -1337,5 +1421,221 @@ mod tests {
         assert_eq!(tree.idom(BlockId(99)), None);
         assert!(!tree.dominates(BlockId(0), BlockId(99)));
         assert!(!tree.dominates(BlockId(99), BlockId(0)));
+    }
+
+    // ====================================================================
+    // Stage 10: numeric-for (FORI/FORL) CFG tests
+    // ====================================================================
+
+    // Source: `for i = 1, 10 do local x = i end`. Bytecode (from
+    // `luajit -bl`): KSHORT 0 1; KSHORT 1 10; KSHORT 2 1; FORI 0 => 07;
+    // MOV 4 3; FORL 0 => 05; RET0.
+    //
+    // FORI D encoding matches JMP: D=0x8002 → j=2 → target=4+1+2=7.
+    // FORL D encoding: D=0x7ffe → j=-2 → target=6+1-2=5 (back-edge).
+    #[test]
+    fn fori_forl_produce_loop_init_and_latch_blocks() {
+        let proto = proto_with_real_insts(vec![
+            ad(Opcode::Kshort, 0, 1),    // idx 1 — start
+            ad(Opcode::Kshort, 1, 10),   // idx 2 — stop
+            ad(Opcode::Kshort, 2, 1),    // idx 3 — step
+            ad(Opcode::Fori, 0, 0x8002), // idx 4 — FORI: target = idx 7 (exit)
+            ad(Opcode::Mov, 4, 3),       // idx 5 — body: x = i
+            ad(Opcode::Forl, 0, 0x7ffe), // idx 6 — FORL: target = idx 5 (body)
+            ad(Opcode::Ret0, 0, 1),      // idx 7 — exit
+        ]);
+        let cfg = Cfg::build(&proto);
+
+        // Leaders: {1 (entry), 5 (after FORI = body), 6 (FORL target
+        // = body again, already a leader), 7 (after FORL = exit)}.
+        // Wait — the FORL's target is idx 5 (already a leader from
+        // FORI's fall-through), and the FORL's fall-through is idx 7
+        // (already a leader from FORI's jump target). So leaders =
+        // {1, 5, 7}. Block 0 = [1,2,3,4], Block 1 = [5,6], Block 2 =
+        // [7].
+        assert_eq!(cfg.blocks.len(), 3, "expected pre-loop + body + exit");
+        assert_block_id(cfg.entry, 0);
+
+        // Block 0 (pre-loop + FORI): [KSHORT, KSHORT, KSHORT, FORI]
+        // → LoopInit { base=0, exit=Block(2), body=Block(1) }.
+        let pre_loop = &cfg.blocks[0];
+        assert_eq!(
+            pre_loop.insts,
+            vec![
+                InstructionId(1),
+                InstructionId(2),
+                InstructionId(3),
+                InstructionId(4)
+            ]
+        );
+        match &pre_loop.terminator {
+            Terminator::LoopInit { base, exit, body } => {
+                assert_eq!(*base, 0, "FORI base");
+                assert_block_id(*exit, 2);
+                assert_block_id(*body, 1);
+            }
+            other => panic!("expected LoopInit, got {:?}", other),
+        }
+        // true_edge (jump) = exit, false_edge (fall-through) = body.
+        assert_eq!(
+            pre_loop.succs,
+            vec![(BlockId(2), EdgeKind::True), (BlockId(1), EdgeKind::False)]
+        );
+        assert!(pre_loop.preds.is_empty(), "entry has no preds");
+
+        // Block 1 (body + FORL): [MOV, FORL] → LoopLatch { base=0,
+        // body=Block(1), exit=Block(2) }. The back-edge target is
+        // itself (Block 1).
+        let body = &cfg.blocks[1];
+        assert_eq!(body.insts, vec![InstructionId(5), InstructionId(6)]);
+        match &body.terminator {
+            Terminator::LoopLatch {
+                base,
+                body: b,
+                exit,
+            } => {
+                assert_eq!(*base, 0, "FORL base");
+                assert_block_id(*b, 1);
+                assert_block_id(*exit, 2);
+            }
+            other => panic!("expected LoopLatch, got {:?}", other),
+        }
+        // true_edge (back-edge jump) = body, false_edge = exit.
+        assert_eq!(
+            body.succs,
+            vec![(BlockId(1), EdgeKind::True), (BlockId(2), EdgeKind::False)]
+        );
+        // Body has two preds: pre-loop (via FORI fall-through) and
+        // itself (via FORL back-edge).
+        assert_eq!(body.preds, vec![BlockId(0), BlockId(1)]);
+
+        // Block 2 (exit): [RET0] → Return. Two preds: pre-loop (via
+        // FORI jump when loop is empty) and body (via FORL
+        // fall-through when loop completes).
+        let exit = &cfg.blocks[2];
+        assert_eq!(exit.insts, vec![InstructionId(7)]);
+        assert!(matches!(exit.terminator, Terminator::Return));
+        assert!(exit.succs.is_empty());
+        assert_eq!(exit.preds, vec![BlockId(0), BlockId(1)]);
+    }
+
+    // FORI/FORL with a base slot other than 0 (e.g., when a local
+    // precedes the loop). Source shape: `local sum = 0; for i = 1, 10
+    // do sum = sum + i end`. Verifies the base slot is correctly
+    // extracted from the FORI/FORL A operand.
+    #[test]
+    fn fori_forl_propagate_nonzero_base_slot() {
+        // ADDVV is ABC; build it inline since the cfg test helpers
+        // only include `ad` (AD-format).
+        let addvv = Instruction {
+            op: Opcode::Addvv,
+            a: 0,
+            b_or_d: 0,
+            c: 4,
+        };
+        let proto = proto_with_real_insts(vec![
+            ad(Opcode::Kshort, 0, 0),    // idx 1 — sum = 0
+            ad(Opcode::Kshort, 1, 1),    // idx 2 — start
+            ad(Opcode::Kshort, 2, 10),   // idx 3 — stop
+            ad(Opcode::Kshort, 3, 1),    // idx 4 — step
+            ad(Opcode::Fori, 1, 0x8002), // idx 5 — FORI base=1: target = idx 8
+            addvv,                       // idx 6 — body: sum = sum + i
+            ad(Opcode::Forl, 1, 0x7ffe), // idx 7 — FORL base=1: target = idx 6
+            ad(Opcode::Ret1, 0, 2),      // idx 8 — exit
+        ]);
+        let cfg = Cfg::build(&proto);
+        assert_eq!(cfg.blocks.len(), 3);
+        match &cfg.blocks[0].terminator {
+            Terminator::LoopInit { base, exit, body } => {
+                assert_eq!(*base, 1, "FORI base should be slot 1");
+                assert_block_id(*exit, 2);
+                assert_block_id(*body, 1);
+            }
+            other => panic!("expected LoopInit, got {:?}", other),
+        }
+        match &cfg.blocks[1].terminator {
+            Terminator::LoopLatch { base, body, exit } => {
+                assert_eq!(*base, 1, "FORL base should be slot 1");
+                assert_block_id(*body, 1);
+                assert_block_id(*exit, 2);
+            }
+            other => panic!("expected LoopLatch, got {:?}", other),
+        }
+    }
+
+    // A loop body that returns creates a dead FORL block (the RET1
+    // ends the body block, so the FORL becomes its own unreachable
+    // block). Verifies the CFG surfaces this structure faithfully —
+    // the recovery handles it by skipping the dead block via
+    // LoopInit.exit.
+    //
+    // Source: `for i = 1, 3 do return i end`.
+    //   KSHORT 0 1; KSHORT 1 3; KSHORT 2 1; FORI 0 => 07;
+    //   RET1 3 2; FORL 0 => 05; RET0.
+    #[test]
+    fn fori_with_returning_body_creates_dead_forl_block() {
+        let proto = proto_with_real_insts(vec![
+            ad(Opcode::Kshort, 0, 1),
+            ad(Opcode::Kshort, 1, 3),
+            ad(Opcode::Kshort, 2, 1),
+            ad(Opcode::Fori, 0, 0x8002), // idx 4: target = idx 7
+            ad(Opcode::Ret1, 3, 2),      // idx 5: body returns
+            ad(Opcode::Forl, 0, 0x7ffe), // idx 6: dead FORL
+            ad(Opcode::Ret0, 0, 1),      // idx 7
+        ]);
+        let cfg = Cfg::build(&proto);
+
+        // Leaders: {1, 5 (body), 6 (after RET1), 7 (after FORL)}.
+        // 4 blocks: pre-loop, body, dead-FORL, exit.
+        assert_eq!(cfg.blocks.len(), 4);
+
+        // Block 0 (pre-loop + FORI) → LoopInit.
+        match &cfg.blocks[0].terminator {
+            Terminator::LoopInit {
+                base: _,
+                exit,
+                body,
+            } => {
+                assert_block_id(*exit, 3);
+                assert_block_id(*body, 1);
+            }
+            other => panic!("expected LoopInit, got {:?}", other),
+        }
+        // Block 1 (body): [RET1] → Return. No succs.
+        assert!(matches!(cfg.blocks[1].terminator, Terminator::Return));
+        assert!(cfg.blocks[1].succs.is_empty());
+        // Block 2 (dead FORL): [FORL] → LoopLatch. Only pred is
+        // itself (the back-edge); the body returned so it doesn't
+        // fall through.
+        match &cfg.blocks[2].terminator {
+            Terminator::LoopLatch { body, exit, .. } => {
+                assert_block_id(*body, 1);
+                assert_block_id(*exit, 3);
+            }
+            other => panic!("expected LoopLatch, got {:?}", other),
+        }
+        // Block 3 (exit): [RET0] → Return.
+        assert!(matches!(cfg.blocks[3].terminator, Terminator::Return));
+    }
+
+    // Direct verification of the FORI/FORL D encoding. Mirrors the
+    // jmp_target_formula_matches_luajit_bl_output test for JMP: pins
+    // the empirical D values so a regression in the encoding math is
+    // caught at the formula level rather than only via end-to-end
+    // fixtures.
+    #[test]
+    fn fori_forl_d_encoding_matches_jmp_formula() {
+        // FORI at idx 4, D=0x8002 → target = 4 + 1 + (0x8002 - 0x8000) = 7.
+        let proto = proto_with_real_insts(vec![
+            ad(Opcode::Kshort, 0, 1),
+            ad(Opcode::Kshort, 1, 10),
+            ad(Opcode::Kshort, 2, 1),
+            ad(Opcode::Fori, 0, 0x8002), // idx 4
+            ad(Opcode::Mov, 4, 3),
+            ad(Opcode::Forl, 0, 0x7ffe), // idx 6
+            ad(Opcode::Ret0, 0, 1),
+        ]);
+        assert_eq!(Cfg::jmp_target(&proto, 4), Some(7), "FORI D=0x8002 → idx 7");
+        assert_eq!(Cfg::jmp_target(&proto, 6), Some(5), "FORL D=0x7ffe → idx 5");
     }
 }
