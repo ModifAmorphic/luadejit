@@ -1050,6 +1050,19 @@ fn build_test_condition(
 /// paired operator (`<` ↔ `>=`, `==` ↔ `~=`, etc. — see the table
 /// in [`binop_complement`]). For IST/ISF, complementing swaps
 /// truthy ↔ falsy (i.e. wraps/unwraps [`Expr::Not`]).
+/// Build the if-condition expression from an ISxx instruction.
+///
+/// Each ISxx tests a condition; if the test holds, the JMP is taken
+/// (skip then-body). The if-condition (what leads to the then-body) is
+/// the **complement** of the ISxx test. This is LuaJIT's "twist":
+/// `a < b` compiles to `ISGE` (tests >=), `a == b` compiles to `ISNEV`
+/// (tests ~=).
+///
+/// **LuaJIT canonicalizes ordered comparisons to `<`/`<=`** by swapping
+/// operands when needed. So `a > b` in source becomes `b < a` in
+/// bytecode, and the decompiler faithfully reproduces the canonicalized
+/// form (`b < a`) rather than the original (`a > b`). This is semantically
+/// correct but non-canonical — a known limitation.
 fn build_condition(
     proto: &Proto,
     slot_exprs: &HashMap<u8, Expr>,
@@ -2956,39 +2969,31 @@ mod tests {
         assert_eq!(emit(&module), "if a and b and c then\n    return 1\nend");
     }
 
-    /// Mixed `and`/`or` isn't a Stage 9 fixture (no parens yet), but
-    /// the chain detection should still produce *some* output rather
-    /// than panic. `if a and b or c then` lowers to a chain where
-    /// CB1+CB2 form an AND prefix and CB3 short-circuits as OR — the
-    /// algorithm emits `(a and b) or c` without parens. Marked as a
-    /// known-limitation check; the formatting will need a
-    /// precedence-aware pass before mixed chains round-trip cleanly.
+    /// Mixed `and`/`or` chains are not supported in Stage 9 — the chain
+    /// detection requires uniform true_edge targets (all → merge for AND,
+    /// first → then-body for OR). A mixed chain has heterogeneous
+    /// true_edge targets, which neither invariant matches, so the
+    /// recovery correctly returns NotImplemented.
     #[test]
-    fn recover_mixed_and_or_chain_no_parens() {
-        //   GGET 0 0; ISF 0; JMP => 0012;     (CB1 → merge)
-        //   GGET 0 1; ISF 0; JMP => 0012;     (CB2 → merge)
-        //   GGET 0 2; IST 0; JMP => 0010;     (CB3 → then-body)
-        //   KSHORT 0 1; RET1; RET0.
-        //
-        // Chain order: CB1.false_edge → CB2, CB2.false_edge → CB3,
-        // CB3.false_edge → then-body. First CB's true_edge (merge) !=
-        // last CB's false_edge (then-body) → AND check: CB1.true,
-        // CB2.true == merge ✓, CB3.true == then-body ✗ → AND fails
-        // → NotImplemented (correct: Stage 9 doesn't handle mixed
-        // chains where the join shape isn't uniform).
+    fn recover_mixed_and_or_chain_bails() {
+        // CB1: ISF a; JMP → merge (true_edge = merge).
+        // CB2: ISF b; JMP → merge (true_edge = merge).
+        // CB3: IST c; JMP → then-body (true_edge = then-body).
+        // The AND invariant fails (CB3.true != merge) and the OR
+        // invariant fails (CB1.true != then-body). → NotImplemented.
         let insts = vec![
-            ad(Opcode::Gget, 0, 0),     // idx 1
+            ad(Opcode::Gget, 0, 0),     // idx 1: a
             ad(Opcode::Isf, 0, 0),      // idx 2
-            ad(Opcode::Jmp, 1, 0x8008), // idx 3: target = idx 12
-            ad(Opcode::Gget, 0, 1),     // idx 4
+            ad(Opcode::Jmp, 1, 0x8008), // idx 3: target = idx 12 (merge)
+            ad(Opcode::Gget, 0, 1),     // idx 4: b
             ad(Opcode::Isf, 0, 0),      // idx 5
-            ad(Opcode::Jmp, 1, 0x8005), // idx 6: target = idx 12
-            ad(Opcode::Gget, 0, 2),     // idx 7
+            ad(Opcode::Jmp, 1, 0x8005), // idx 6: target = idx 12 (merge)
+            ad(Opcode::Gget, 0, 2),     // idx 7: c
             ad(Opcode::Ist, 0, 0),      // idx 8
             ad(Opcode::Jmp, 1, 0x8001), // idx 9: target = idx 11 (then-body)
-            ad(Opcode::Kshort, 0, 1),   // idx 10 (unreachable from chain?)
-            ad(Opcode::Ret1, 0, 2),     // idx 11 (then-body end)
-            ad(Opcode::Ret0, 0, 1),     // idx 12 (merge)
+            ad(Opcode::Kshort, 0, 1),   // idx 10: then-body (live: CB3.true → here)
+            ad(Opcode::Ret1, 0, 2),     // idx 11
+            ad(Opcode::Ret0, 0, 1),     // idx 12: merge
         ];
         let module = module_with(
             insts,
