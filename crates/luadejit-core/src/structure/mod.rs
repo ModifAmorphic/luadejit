@@ -3963,9 +3963,6 @@ mod tests {
     /// body Vec.
     #[test]
     fn recover_repeat_empty_body() {
-        //   KSHORT 0 1; LOOP 1 => 0006; ISGT 1 0; JMP => 0002; RET0.
-        // (slot 0 = x = 1, slot 1 = constant 2 for the comparison)
-        // Wait — we need the test to be self-contained. Let's use:
         //   KSHORT 0 0; LOOP 1 => 0006; KSHORT 1 3; ISGT 1 0; JMP => 0002; RET0.
         // Loop runs zero times if i happens to already be >= 3, but
         // for testing purposes the bytecode shape is what matters.
