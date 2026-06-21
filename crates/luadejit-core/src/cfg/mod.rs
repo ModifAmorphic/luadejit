@@ -4,10 +4,11 @@
 //! **Stage 7a**: builds basic blocks and wires predecessor/successor
 //! edges. **Stage 7b**: adds dominator-tree computation
 //! ([`Cfg::compute_dominators`]) via the Cooper-Harvey-Kennedy
-//! iterative algorithm. The CFG is not yet consumed by the emit
-//! pipeline — the walk-based emitter in [`crate::emit`] continues to
-//! handle decompilation unchanged. This module is pure infrastructure
-//! that later stages (SSA, structural recovery) will build on.
+//! iterative algorithm. **Stage 7c-7e**: the emit pipeline now
+//! builds a CFG for every proto and feeds it to
+//! [`crate::structure::recover`]; the dominator tree remains
+//! on-demand infrastructure for the SSA / phi-elimination stages
+//! still ahead.
 //!
 //! See `docs/architecture-v2-data-structures.md` §2 for the type
 //! specifications and `docs/luajit-bytecode-format.md` §4.2 for the

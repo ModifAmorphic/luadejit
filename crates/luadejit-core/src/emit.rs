@@ -1,1400 +1,337 @@
 //! Source emission from a parsed [`Module`].
 //!
-//! - **Stage 1**: handles the degenerate case where the main proto's
-//!   only real instruction (excluding the synthetic FUNC* header) is
-//!   `RET0`. That case corresponds to a Lua source chunk of just
-//!   `return`, which round-trips to empty source.
-//! - **Stage 2**: handles `return <const>` for the four constant-load
-//!   opcodes (`KSHORT`, `KNUM`, `KSTR`, `KPRI`) followed by
-//!   `RET1 0 2`. The emitted source is `return <const>` with no
-//!   trailing newline.
-//! - **Stage 3**: handles `local x = <const>` declarations. The key
-//!   insight is that `local x = 5; return x` compiles to the *same*
-//!   real instructions as `return 5` (`KSHORT 0 5; RET1 0 2`); the
-//!   only difference is the debug section's `var_info` naming slot 0
-//!   as "x". When a constant load writes to a slot the debug info
-//!   names as a live local, we emit `local x = <const>; return x`
-//!   (or just `local x = <const>` when the implicit return is
-//!   `RET0`). The debug info is the discriminator.
-//! - **Stage 4**: handles single binary arithmetic expressions whose
-//!   result is returned (`Addvn`/`Addnv`/`Addvv` and the `Sub`/`Mul`/
-//!   `Div`/`Mod` variants, plus `Pow` and `Cat`). The walk records the
-//!   expression string for the destination slot; `RET1` then surfaces
-//!   the expression as the returned value.
-//! - **Stage 5**: handles multi-statement sequences. The Stage 4 walk
-//!   already covered most of this — the two gaps closed here are (a)
-//!   arithmetic instructions whose destination slot has a named local
-//!   now emit `local <name> = <expr>` (and store the name for later
-//!   reference), and (b) `MOV A D` is supported (copies slot D's
-//!   expression into slot A, with the same named-local handling).
-//! - **Stage 6**: handles local reassignment. A second store to a
-//!   slot whose variable is already in scope (`local a = 1; a = 2`)
-//!   now emits `a = 2` (no `local`), instead of incorrectly
-//!   re-declaring the variable. The discriminator is
-//!   [`Proto::is_var_declaration_at`]: stores where the instruction
-//!   index equals the variable's `scope_begin` are declarations; all
-//!   other stores to a named slot are reassignments.
+//! Stage 7 rewrites this module to walk the structured AST produced
+//! by [`crate::structure::recover`] rather than raw bytecode. The
+//! public entry point [`emit_module`] is unchanged: callers still
+//! hand it a parsed [`Module`] and get back a source string. The new
+//! pipeline runs *inside* `emit_module`:
 //!
-//! Every other input returns [`DecompilerError::NotImplemented`] —
-//! the pipeline grows into more cases in later stages.
+//! 1. Build the [`Cfg`](crate::cfg::Cfg) for the main proto.
+//! 2. [`structure::recover`] the AST (`Vec<Stmt>`).
+//! 3. [`emit_ast`] formats the AST to a source string.
+//!
+//! Linear code (Stages 1-6 shapes) round-trips identically to the
+//! old walk-based emitter; the new capability is `if/then`. Any
+//! CFG shape the recovery doesn't model surfaces as
+//! [`DecompilerError::NotImplemented`].
+//!
+//! ## Formatting invariants
+//!
+//! - Statements join with `\n`; no trailing newline.
+//! - `Return(None)` (implicit return) emits no line — the source
+//!   chunk just ends.
+//! - `if/then` bodies indent 4 spaces per level.
+//! - Number literals go through [`crate::number::format_lua_number`]
+//!   so floats round-trip LuaJIT's `%.14g` formatting.
+//! - String literals use Rust's `{:?}` (close enough to Lua's
+//!   escaping for the common cases; full escape parity is a later
+//!   stage).
 
-use std::collections::HashMap;
-
-use crate::ir::{GcConst, Instruction, Module, NumConst, Opcode, Proto};
+use crate::cfg::Cfg;
+use crate::ir::Module;
 use crate::number::format_lua_number;
+use crate::structure::{recover, BinOpKind, Expr, Stmt};
 use crate::DecompilerError;
+
+/// Number of spaces per indentation level. Matches LuaJIT's
+/// `luajit -b` pretty-printer and the canonical Lua style.
+const INDENT_SPACES: usize = 4;
 
 /// Emit Lua source from a parsed module.
 ///
-/// Walks the main proto's real instructions in order, threading a
-/// `slot_exprs` map (register slot → the source expression currently
-/// occupying it). Constant-load opcodes, arithmetic opcodes, and `MOV`
-/// may all emit a `local` declaration or a bare reassignment when the
-/// debug info names their target slot — the [`assign_slot`] helper
-/// centralizes that decision (Stage 6: declaration iff the instruction
-/// index equals the variable's `scope_begin`). `RET0` terminates the
-/// chunk (possibly with no emitted statements); `RET1` materializes
-/// one slot's expression as the return value. Any opcode not yet
-/// handled, or any shape we can't model, returns
-/// [`DecompilerError::NotImplemented`].
+/// Builds the CFG for the main proto, recovers the AST, then
+/// formats the AST to a source string. Returns
+/// [`DecompilerError::NotImplemented`] for any input the recovery
+/// doesn't model (if/else, loops, function calls, nested `if`,
+/// compound conditions, etc.).
 pub fn emit_module(module: &Module) -> Result<String, DecompilerError> {
     let main = module.main_proto();
-    // Slot 0 is the synthesized FUNC* header; real instructions start
-    // at index 1. The walk index is relative to `real_insts`, which
-    // matches the convention `var_name_at` expects (0 = first real
-    // instruction, not counting the FUNC* header at in-memory slot 0).
-    let real_insts = &main.insts[1..];
+    let cfg = Cfg::build(main);
+    let ast = recover(main, &cfg)?;
+    Ok(emit_ast(&ast))
+}
 
-    let mut slot_exprs: HashMap<u8, String> = HashMap::new();
-    let mut lines: Vec<String> = Vec::new();
-    let mut saw_return = false;
-
-    for (idx, inst) in real_insts.iter().enumerate() {
-        match inst.op {
-            Opcode::Ret0 => {
-                // Implicit end-of-chunk return. No statement emitted;
-                // whatever's accumulated in `lines` is the source.
-                saw_return = true;
-                break;
-            }
-            Opcode::Ret1 => {
-                // `RET1 A D` returns one value from `r(A)`; the
-                // single-value-return convention is `D == 2`. We don't
-                // restrict `A` to 0 (it can be any slot whose
-                // expression we've recorded); a slot with no recorded
-                // expression means we've hit a shape we don't model.
-                if inst.d() != 2 {
-                    return Err(DecompilerError::NotImplemented);
-                }
-                let expr = slot_exprs
-                    .get(&inst.a)
-                    .ok_or(DecompilerError::NotImplemented)?;
-                lines.push(format!("return {}", expr));
-                saw_return = true;
-                break;
-            }
-            Opcode::Kshort | Opcode::Knum | Opcode::Kstr | Opcode::Kpri => {
-                let expr = const_load_expr(main, inst)?;
-                // Stage 3 discriminator: if the debug section names
-                // this slot as a live local at this instruction, the
-                // load is a `local <name> = <expr>` declaration rather
-                // than a transient write. `assign_slot` handles both
-                // paths (emit + store name, or store as temp).
-                assign_slot(main, &mut slot_exprs, &mut lines, inst.a, expr, idx);
-            }
-            // ---- Stage 4 binary arithmetic ----------------------------
-            //
-            // Arithmetic opcodes write the result to a slot. As with
-            // loads, if that slot has a named local at this
-            // instruction (Stage 5), we emit a `local <name> = <expr>`
-            // declaration and store the name; otherwise the expression
-            // is recorded as an unnamed temporary that surfaces only
-            // when RET1 reads the slot. `assign_slot` handles both.
-            //
-            // Known limitation: nested arithmetic expressions are
-            // emitted without parenthesization. This works whenever
-            // Lua's precedence matches the bytecode's evaluation order
-            // (the common case: `a + b * c`, `a + b + c`) but produces
-            // incorrect output for cases where the bytecode reorders
-            // against precedence, e.g. `(a + b) * c` would be emitted
-            // as `a + b * c`. Correct parenthesization is deferred to
-            // a later stage; Stage 4 only emits single binops.
-            //
-            // VN: left = reg[B], right = num_const[C].
-            Opcode::Addvn | Opcode::Subvn | Opcode::Mulvn | Opcode::Divvn | Opcode::Modvn => {
-                let left = lookup_operand(&slot_exprs, inst.b())?;
-                let right = format_num_const(&main.num_consts, inst.c as usize)?;
-                let expr = format!("{} {} {}", left, arith_symbol(inst.op), right);
-                assign_slot(main, &mut slot_exprs, &mut lines, inst.a, expr, idx);
-            }
-            // NV: left = num_const[B], right = reg[C].
-            Opcode::Addnv | Opcode::Subnv | Opcode::Mulnv | Opcode::Divnv | Opcode::Modnv => {
-                let left = format_num_const(&main.num_consts, inst.b() as usize)?;
-                let right = lookup_operand(&slot_exprs, inst.c)?;
-                let expr = format!("{} {} {}", left, arith_symbol(inst.op), right);
-                assign_slot(main, &mut slot_exprs, &mut lines, inst.a, expr, idx);
-            }
-            // VV: left = reg[B], right = reg[C].
-            Opcode::Addvv | Opcode::Subvv | Opcode::Mulvv | Opcode::Divvv | Opcode::Modvv => {
-                let left = lookup_operand(&slot_exprs, inst.b())?;
-                let right = lookup_operand(&slot_exprs, inst.c)?;
-                let expr = format!("{} {} {}", left, arith_symbol(inst.op), right);
-                assign_slot(main, &mut slot_exprs, &mut lines, inst.a, expr, idx);
-            }
-            Opcode::Pow => {
-                // POW has no VN/NV variants — both operands are
-                // registers (same VV shape as above). Kept as its own
-                // arm rather than folded into the VV match because the
-                // operator is fixed (`^`) rather than looked up.
-                let left = lookup_operand(&slot_exprs, inst.b())?;
-                let right = lookup_operand(&slot_exprs, inst.c)?;
-                let expr = format!("{} ^ {}", left, right);
-                assign_slot(main, &mut slot_exprs, &mut lines, inst.a, expr, idx);
-            }
-            Opcode::Cat => {
-                // CAT concatenates regs[B..=C] into A (a range, not
-                // just two operands). LuaJIT lowers `a .. b .. c` to a
-                // single CAT whose [B, C] covers all three slots.
-                let mut parts: Vec<String> = Vec::new();
-                for slot in inst.b()..=inst.c {
-                    parts.push(lookup_operand(&slot_exprs, slot)?);
-                }
-                let expr = parts.join(" .. ");
-                assign_slot(main, &mut slot_exprs, &mut lines, inst.a, expr, idx);
-            }
-            // ---- Stage 5: MOV A D -----------------------------------
-            //
-            // MOV copies slot D's expression into slot A. The source
-            // must already have a recorded expression (otherwise we've
-            // hit a shape we don't model). MOV is AD format, so the
-            // source register is D; registers are 8-bit, so reading D
-            // as `u8` is correct.
-            Opcode::Mov => {
-                let source_slot = inst.d() as u8;
-                let source_expr = slot_exprs
-                    .get(&source_slot)
-                    .cloned()
-                    .ok_or(DecompilerError::NotImplemented)?;
-                assign_slot(main, &mut slot_exprs, &mut lines, inst.a, source_expr, idx);
-            }
-            _ => return Err(DecompilerError::NotImplemented),
+/// Format a sequence of statements as Lua source. Statements are
+/// joined by `\n`; `Return(None)` emits nothing. No trailing newline.
+fn emit_ast(stmts: &[Stmt]) -> String {
+    let mut lines: Vec<String> = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
+        if let Some(line) = format_stmt(stmt, 0) {
+            lines.push(line);
         }
     }
-
-    if !saw_return {
-        return Err(DecompilerError::NotImplemented);
-    }
-    Ok(lines.join("\n"))
+    lines.join("\n")
 }
 
-/// Resolve a register operand to its recorded expression string. A
-/// missing slot means we've hit an instruction whose source we can't
-/// reconstruct from what we've seen so far (e.g. an uninitialized
-/// register, or a slot populated by an opcode this stage doesn't
-/// handle); we bail with [`DecompilerError::NotImplemented`].
-fn lookup_operand(slot_exprs: &HashMap<u8, String>, slot: u8) -> Result<String, DecompilerError> {
-    slot_exprs
-        .get(&slot)
-        .cloned()
-        .ok_or(DecompilerError::NotImplemented)
-}
-
-/// Record a slot's expression. If the proto's debug section names the
-/// slot as a live local at `inst_index`, emit either a declaration or
-/// reassignment:
-///
-/// - **Declaration** (`is_var_declaration_at` returns true — the
-///   instruction index equals the variable's `scope_begin`): emit
-///   `local <name> = <expr>`.
-/// - **Reassignment** (the slot has a named local in scope, but the
-///   instruction is past its declaration point): emit `<name> = <expr>`
-///   without the `local` keyword.
-///
-/// Both paths store the *name* under the slot (so a later
-/// `return <name>` references the local, not the original expression).
-/// When the slot has no named local, the expression is recorded as an
-/// unnamed temporary that only surfaces when a later instruction (e.g.
-/// `RET1`) reads the slot.
-///
-/// Shared by the constant-load, arithmetic, and `MOV` arms of the walk
-/// — all three share the same "destination slot may be a declaration,
-/// reassignment, or unnamed temporary" bookkeeping. The discriminator
-/// is purely the debug info's [`Proto::var_name_at`] plus
-/// [`Proto::is_var_declaration_at`]; the bytecode shape is identical
-/// either way.
-fn assign_slot(
-    proto: &Proto,
-    slot_exprs: &mut HashMap<u8, String>,
-    lines: &mut Vec<String>,
-    slot: u8,
-    expr: String,
-    inst_index: usize,
-) {
-    if let Some(name) = proto.var_name_at(slot, inst_index) {
-        if proto.is_var_declaration_at(slot, inst_index) {
-            // Declaration: `local name = expr`.
-            lines.push(format!("local {} = {}", name, expr));
-        } else {
-            // Reassignment: `name = expr` (no `local` keyword).
-            lines.push(format!("{} = {}", name, expr));
+/// Format one statement at the given indent level. Returns `None`
+/// for `Return(None)` (implicit return — emits no line). `If` nodes
+/// indent their body by one level; the `else_body` slot exists on
+/// the variant for forward-compatibility but Stage 7 recovery never
+/// produces one, so reaching a populated `else_body` here is a
+/// logic bug.
+fn format_stmt(stmt: &Stmt, indent: usize) -> Option<String> {
+    let pad = " ".repeat(indent * INDENT_SPACES);
+    match stmt {
+        Stmt::LocalDecl { name, expr } => {
+            Some(format!("{}local {} = {}", pad, name, format_expr(expr)))
         }
-        slot_exprs.insert(slot, name.to_string());
-    } else {
-        slot_exprs.insert(slot, expr);
+        Stmt::Assign { name, expr } => Some(format!("{}{} = {}", pad, name, format_expr(expr))),
+        Stmt::Return(Some(expr)) => Some(format!("{}return {}", pad, format_expr(expr))),
+        Stmt::Return(None) => None,
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            if else_body.is_some() {
+                unreachable!("Stage 7 recovery never emits an else_body; if/else is Stage 8");
+            }
+            let mut out = format!("{}if {} then", pad, format_expr(cond));
+            for inner in then_body {
+                if let Some(line) = format_stmt(inner, indent + 1) {
+                    out.push('\n');
+                    out.push_str(&line);
+                }
+            }
+            out.push('\n');
+            out.push_str(&pad);
+            out.push_str("end");
+            Some(out)
+        }
     }
 }
 
-/// Map an arithmetic opcode to its Lua source operator. Covers all
-/// `ADD`/`SUB`/`MUL`/`DIV`/`MOD` variants (VN/NV/VV); `Pow` and `Cat`
-/// are handled inline in the walk rather than through this helper
-/// since they don't share the *VN/*NV/*VV pattern.
-fn arith_symbol(op: Opcode) -> &'static str {
+/// Format an expression as Lua source.
+///
+/// Known limitation (carried over from Stage 4): nested arithmetic
+/// is emitted without parenthesization. This works whenever Lua's
+/// precedence matches the bytecode's evaluation order (the common
+/// case) but produces incorrect output for cases where the bytecode
+/// reorders against precedence, e.g. `(a + b) * c` would be emitted
+/// as `a + b * c`. Correct parenthesization is deferred to a later
+/// stage.
+fn format_expr(expr: &Expr) -> String {
+    match expr {
+        // `Var` and `Global` both surface as bare names at the Lua
+        // source level — a global is just an unqualified identifier
+        // at the top of the chunk.
+        Expr::Var(name) | Expr::Global(name) => name.clone(),
+        Expr::Int(i) => format!("{}", i),
+        Expr::Float(f) => format_lua_number(*f),
+        Expr::Str(bytes) => {
+            // Lossy UTF-8 conversion + Rust's `{:?}` — same Stage 2
+            // behavior the walk-based emitter used for KSTR.
+            let s = String::from_utf8_lossy(bytes);
+            format!("{:?}", s)
+        }
+        Expr::Nil => "nil".to_string(),
+        Expr::True => "true".to_string(),
+        Expr::False => "false".to_string(),
+        Expr::BinOp { op, left, right } => {
+            format!(
+                "{} {} {}",
+                format_expr(left),
+                binop_symbol(*op),
+                format_expr(right)
+            )
+        }
+        Expr::Not(inner) => format!("not {}", format_expr(inner)),
+    }
+}
+
+/// Map a [`BinOpKind`] to its Lua source operator.
+fn binop_symbol(op: BinOpKind) -> &'static str {
     match op {
-        Opcode::Addvn | Opcode::Addnv | Opcode::Addvv => "+",
-        Opcode::Subvn | Opcode::Subnv | Opcode::Subvv => "-",
-        Opcode::Mulvn | Opcode::Mulnv | Opcode::Mulvv => "*",
-        Opcode::Divvn | Opcode::Divnv | Opcode::Divvv => "/",
-        Opcode::Modvn | Opcode::Modnv | Opcode::Modvv => "%",
-        // Pow and Cat aren't routed through this helper; reaching
-        // here is a logic bug rather than a malformed-input case.
-        _ => unreachable!("arith_symbol called on non-arithmetic opcode {:?}", op),
+        BinOpKind::Add => "+",
+        BinOpKind::Sub => "-",
+        BinOpKind::Mul => "*",
+        BinOpKind::Div => "/",
+        BinOpKind::Mod => "%",
+        BinOpKind::Pow => "^",
+        BinOpKind::Concat => "..",
     }
-}
-
-/// Render the source expression produced by a constant-load
-/// instruction. Returns [`DecompilerError::NotImplemented`] for
-/// opcodes/load shapes this stage doesn't handle.
-fn const_load_expr(proto: &Proto, load: &Instruction) -> Result<String, DecompilerError> {
-    match load.op {
-        Opcode::Kshort => {
-            // D is a signed 16-bit immediate (the value itself, not
-            // an index). Reinterpret the u16 bits as i16, then widen
-            // to i32 preserving sign.
-            let val = load.d() as i16 as i32;
-            Ok(format!("{}", val))
-        }
-        Opcode::Knum => {
-            // D is a forward index into num_consts. The shared
-            // helper does the bounds check and renders the value.
-            let idx = load.d() as usize;
-            format_num_const(&proto.num_consts, idx)
-        }
-        Opcode::Kstr => {
-            // D is a reverse index into gc_consts — use the helper to
-            // avoid the classic forward-vs-reverse indexing bug.
-            let gc = proto.gc_const_for_operand(load.d())?;
-            match gc {
-                GcConst::Str(bytes) => {
-                    // Stage 2 limitation: use Rust's `{:?}` formatting,
-                    // which matches Lua's escaping for common cases
-                    // (\", \n, \t, \\). Full Lua string escaping (e.g.
-                    // the exact set of control-char shorthands and
-                    // non-printable hex forms) is deferred to a later
-                    // stage. The format doesn't guarantee UTF-8; we use
-                    // a lossy conversion so emit never panics on
-                    // well-formed bytecode.
-                    let s = String::from_utf8_lossy(bytes);
-                    Ok(format!("{:?}", s))
-                }
-                // Non-string GC constants loaded via KSTR aren't part
-                // of any current stage.
-                _ => Err(DecompilerError::NotImplemented),
-            }
-        }
-        Opcode::Kpri => match load.d() {
-            0 => Ok("nil".to_string()),
-            1 => Ok("false".to_string()),
-            2 => Ok("true".to_string()),
-            _ => Err(DecompilerError::NotImplemented),
-        },
-        _ => Err(DecompilerError::NotImplemented),
-    }
-}
-
-/// Format a number constant from a proto's `num_consts` table by
-/// forward index. Shared by KNUM loading and the arithmetic `*VN` /
-/// `*NV` operand paths, which both resolve number-constant operands
-/// the same way (forward index, LuaJIT-compatible formatting).
-///
-/// Returns [`DecompilerError::NotImplemented`] if `idx` is out of
-/// range — malformed bytecode belongs to the parser, so an out-of-range
-/// index here means we're past the validity boundary and should bail
-/// rather than guess.
-fn format_num_const(num_consts: &[NumConst], idx: usize) -> Result<String, DecompilerError> {
-    let nc = num_consts.get(idx).ok_or(DecompilerError::NotImplemented)?;
-    Ok(match nc {
-        NumConst::Int(i) => format!("{}", i),
-        NumConst::Num(f) => format_lua_number(*f),
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{
-        DebugInfo, GcConst, Instruction, ModuleHeader, NumConst, Opcode, Proto, UpvalDesc,
-    };
+    use crate::structure::{BinOpKind, Expr, Stmt};
 
-    fn ret_only_module() -> Module {
-        Module {
-            header: ModuleHeader {
-                flags: 0,
-                chunkname: None,
-            },
-            protos: vec![Proto {
-                flags: 0,
-                numparams: 0,
-                framesize: 1,
-                upvalues: Vec::<UpvalDesc>::new(),
-                gc_consts: Vec::<GcConst>::new(),
-                num_consts: Vec::<NumConst>::new(),
-                insts: vec![
-                    Instruction::synthetic_header(Opcode::Funcv, 1),
-                    Instruction {
-                        op: Opcode::Ret0,
-                        a: 0,
-                        b_or_d: 1,
-                        c: 0,
-                    },
-                ],
-                debug: Some(DebugInfo::default()),
-            }],
-        }
-    }
-
-    #[test]
-    fn emit_ret0_only_returns_empty_source() {
-        let module = ret_only_module();
-        let source = emit_module(&module).expect("RET0-only should emit");
-        assert_eq!(source, "");
-    }
-
-    /// Build a main proto whose real instructions are exactly
-    /// `[load, RET1 0 2]` — the Stage 2 shape. Caller supplies the
-    /// load instruction and any tables its opcode resolves against.
-    fn return_const_module(
-        load: Instruction,
-        gc_consts: Vec<GcConst>,
-        num_consts: Vec<NumConst>,
-    ) -> Module {
-        Module {
-            header: ModuleHeader {
-                flags: 0,
-                chunkname: None,
-            },
-            protos: vec![Proto {
-                flags: 0,
-                numparams: 0,
-                framesize: 1,
-                upvalues: Vec::<UpvalDesc>::new(),
-                gc_consts,
-                num_consts,
-                insts: vec![
-                    Instruction::synthetic_header(Opcode::Funcv, 1),
-                    load,
-                    Instruction {
-                        op: Opcode::Ret1,
-                        a: 0,
-                        b_or_d: 2,
-                        c: 0,
-                    },
-                ],
-                debug: Some(DebugInfo::default()),
-            }],
-        }
-    }
-
-    #[test]
-    fn emit_return_const_kshort() {
-        // `return 5`: KSHORT 0 5; RET1 0 2.
-        let load = Instruction {
-            op: Opcode::Kshort,
-            a: 0,
-            b_or_d: 5,
-            c: 0,
-        };
-        let module = return_const_module(load, Vec::new(), Vec::new());
-        assert_eq!(emit_module(&module).unwrap(), "return 5");
-    }
-
-    #[test]
-    fn emit_return_const_kshort_negative() {
-        // `return -7`: KSHORT's D is signed 16-bit; -7 as i16 is
-        // 0xFFF9 = 65529 as u16.
-        let load = Instruction {
-            op: Opcode::Kshort,
-            a: 0,
-            b_or_d: 0xFFF9,
-            c: 0,
-        };
-        let module = return_const_module(load, Vec::new(), Vec::new());
-        assert_eq!(emit_module(&module).unwrap(), "return -7");
-    }
-
-    #[test]
-    fn emit_return_const_kpri_nil() {
-        // `return nil`: KPRI 0 0.
-        let load = Instruction {
-            op: Opcode::Kpri,
-            a: 0,
-            b_or_d: 0,
-            c: 0,
-        };
-        let module = return_const_module(load, Vec::new(), Vec::new());
-        assert_eq!(emit_module(&module).unwrap(), "return nil");
-    }
-
-    #[test]
-    fn emit_return_const_kpri_true() {
-        // `return true`: KPRI 0 2.
-        let load = Instruction {
-            op: Opcode::Kpri,
-            a: 0,
-            b_or_d: 2,
-            c: 0,
-        };
-        let module = return_const_module(load, Vec::new(), Vec::new());
-        assert_eq!(emit_module(&module).unwrap(), "return true");
-    }
-
-    #[test]
-    fn emit_return_const_kpri_false() {
-        // `return false`: KPRI 0 1.
-        let load = Instruction {
-            op: Opcode::Kpri,
-            a: 0,
-            b_or_d: 1,
-            c: 0,
-        };
-        let module = return_const_module(load, Vec::new(), Vec::new());
-        assert_eq!(emit_module(&module).unwrap(), "return false");
-    }
-
-    #[test]
-    // The fixture value 3.14 trips clippy::approx_constant (PI). We
-    // intentionally use 3.14 here so the unit test mirrors the
-    // `return_float` integration fixture exactly.
-    #[allow(clippy::approx_constant)]
-    fn emit_return_const_knum() {
-        // `return 3.14`: KNUM 0 0; num_consts = [Num(3.14)].
-        // KNUM's D is a FORWARD index.
-        let load = Instruction {
-            op: Opcode::Knum,
-            a: 0,
-            b_or_d: 0,
-            c: 0,
-        };
-        let module = return_const_module(load, Vec::new(), vec![NumConst::Num(3.14_f64)]);
-        assert_eq!(emit_module(&module).unwrap(), "return 3.14");
-    }
-
-    #[test]
-    fn emit_return_const_knum_int_const() {
-        // A boxed-int num const should format as an integer.
-        let load = Instruction {
-            op: Opcode::Knum,
-            a: 0,
-            b_or_d: 0,
-            c: 0,
-        };
-        let module = return_const_module(load, Vec::new(), vec![NumConst::Int(42)]);
-        assert_eq!(emit_module(&module).unwrap(), "return 42");
-    }
-
-    #[test]
-    fn emit_return_const_kstr() {
-        // `return "foo"`: KSTR 0 0; gc_consts = [Str("foo")].
-        // KSTR's D is a REVERSE index — operand 0 resolves to
-        // gc_consts[len-1-0] = gc_consts[0] when len == 1.
-        let load = Instruction {
-            op: Opcode::Kstr,
-            a: 0,
-            b_or_d: 0,
-            c: 0,
-        };
-        let module = return_const_module(load, vec![GcConst::Str(b"foo".to_vec())], Vec::new());
-        assert_eq!(emit_module(&module).unwrap(), "return \"foo\"");
-    }
-
-    #[test]
-    fn emit_return_const_not_implemented_for_non_zero_ret_a() {
-        // RET1 1 2: A != 0 — not the single-const-return shape.
-        let mut module = return_const_module(
-            Instruction {
-                op: Opcode::Kshort,
-                a: 0,
-                b_or_d: 5,
-                c: 0,
-            },
-            Vec::new(),
-            Vec::new(),
-        );
-        module.protos[0].insts[2].a = 1;
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for RET1 with A != 0, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn emit_return_const_not_implemented_for_wrong_ret_d() {
-        // RET1 0 3: D != 2 — not the single-value-return convention.
-        let mut module = return_const_module(
-            Instruction {
-                op: Opcode::Kshort,
-                a: 0,
-                b_or_d: 5,
-                c: 0,
-            },
-            Vec::new(),
-            Vec::new(),
-        );
-        module.protos[0].insts[2].b_or_d = 3;
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for RET1 with D != 2, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn emit_return_const_not_implemented_for_load_to_nonzero_reg() {
-        // KSHORT 1 5: load targets r1, but RET1 reads r0.
-        let mut module = return_const_module(
-            Instruction {
-                op: Opcode::Kshort,
-                a: 0,
-                b_or_d: 5,
-                c: 0,
-            },
-            Vec::new(),
-            Vec::new(),
-        );
-        module.protos[0].insts[1].a = 1;
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for load targeting r != 0, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn emit_return_const_not_implemented_for_unsupported_load_op() {
-        // Unsupported load opcode (e.g. MOV) in the load slot.
-        let load = Instruction {
-            op: Opcode::Mov,
-            a: 0,
-            b_or_d: 0,
-            c: 0,
-        };
-        let module = return_const_module(load, Vec::new(), Vec::new());
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for unsupported load op, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn emit_returns_not_implemented_for_other_inputs() {
-        // A module whose main proto has a non-RET0 instruction.
-        let mut module = ret_only_module();
-        module.protos[0].insts[1] = Instruction {
-            op: Opcode::Ret1,
-            a: 0,
-            b_or_d: 2,
-            c: 0,
-        };
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented, got {:?}",
-            result
-        );
-    }
-
-    // ---- Stage 3: `local x = <const>` declarations -------------------
+    // ---- format_expr / format_stmt direct tests ------------------------
     //
-    // These mirror the Stage 2 unit tests but with a var_info record
-    // naming the load's target slot. The bytecode shape is identical
-    // to Stage 2's — only the debug section differs, which is exactly
-    // the discriminator `emit_module` consults via `Proto::var_name_at`.
+    // These exercise the new emit-side formatting code in isolation
+    // from the recovery pipeline (which has its own coverage in
+    // `structure::tests`). Every variant of `Expr` / `Stmt` that
+    // Stage 7 can produce gets at least one assertion here.
 
-    /// Build a `VarInfo` record naming `slot` as `name` with a scope
-    /// covering real instructions `begin..=end` (inclusive). This
-    /// mirrors what the parser would produce for `local x = <const>`.
-    fn named_local(slot: u8, name: &str, begin: u32, end: u32) -> crate::ir::VarInfo {
-        crate::ir::VarInfo {
-            kind: crate::ir::VarKind::Name,
-            name: Some(name.to_string()),
-            is_parameter: false,
-            slot,
-            scope_begin: begin,
-            scope_end: end,
+    #[test]
+    fn formats_int() {
+        assert_eq!(format_expr(&Expr::Int(5)), "5");
+        assert_eq!(format_expr(&Expr::Int(-7)), "-7");
+        assert_eq!(format_expr(&Expr::Int(0)), "0");
+    }
+
+    #[test]
+    fn formats_float_through_lua_formatter() {
+        // The pipeline routes Float through format_lua_number; the
+        // 10.0/3.0 case would round differently under Rust's `{}`.
+        assert_eq!(format_expr(&Expr::Float(10.0 / 3.0)), "3.3333333333333");
+        // The fixture value 3.14 trips clippy::approx_constant (PI);
+        // we intentionally use it here to mirror the `return_float`
+        // integration fixture exactly.
+        #[allow(clippy::approx_constant)]
+        let pi_approx = 3.14_f64;
+        assert_eq!(format_expr(&Expr::Float(pi_approx)), "3.14");
+        // Integer-valued floats print without `.0`.
+        assert_eq!(format_expr(&Expr::Float(3.0)), "3");
+    }
+
+    #[test]
+    fn formats_str_with_rust_debug_escaping() {
+        assert_eq!(format_expr(&Expr::Str(b"foo".to_vec())), "\"foo\"");
+        // Bytes are lossy-converted to UTF-8 before `{:?}`. Invalid
+        // UTF-8 becomes the replacement char; emit never panics.
+        assert_eq!(
+            format_expr(&Expr::Str(vec![0xff, 0xfe])),
+            "\"\u{fffd}\u{fffd}\""
+        );
+    }
+
+    #[test]
+    fn formats_nil_true_false() {
+        assert_eq!(format_expr(&Expr::Nil), "nil");
+        assert_eq!(format_expr(&Expr::True), "true");
+        assert_eq!(format_expr(&Expr::False), "false");
+    }
+
+    #[test]
+    fn formats_var_and_global_identically() {
+        // At the Lua source level both surface as bare names.
+        assert_eq!(format_expr(&Expr::Var("x".to_string())), "x");
+        assert_eq!(format_expr(&Expr::Global("x".to_string())), "x");
+    }
+
+    #[test]
+    fn formats_binop_with_correct_symbol() {
+        let left = Box::new(Expr::Var("a".to_string()));
+        let right = Box::new(Expr::Int(3));
+        for (op, sym) in [
+            (BinOpKind::Add, "+"),
+            (BinOpKind::Sub, "-"),
+            (BinOpKind::Mul, "*"),
+            (BinOpKind::Div, "/"),
+            (BinOpKind::Mod, "%"),
+            (BinOpKind::Pow, "^"),
+            (BinOpKind::Concat, ".."),
+        ] {
+            let expr = Expr::BinOp {
+                op,
+                left: left.clone(),
+                right: right.clone(),
+            };
+            assert_eq!(format_expr(&expr), format!("a {} 3", sym));
         }
     }
 
-    /// Build a Stage 3 module: a constant `load` into slot 0 named
-    /// `name` (via var_info) followed by `ret`. The caller supplies
-    /// the load instruction, the return instruction, and any constant
-    /// tables the load resolves against.
-    fn local_module(
-        load: Instruction,
-        ret: Instruction,
-        name: &str,
-        gc_consts: Vec<GcConst>,
-        num_consts: Vec<NumConst>,
-    ) -> Module {
-        Module {
-            header: ModuleHeader {
-                flags: 0,
-                chunkname: None,
+    #[test]
+    fn formats_not() {
+        assert_eq!(
+            format_expr(&Expr::Not(Box::new(Expr::Global("x".to_string())))),
+            "not x"
+        );
+    }
+
+    #[test]
+    fn formats_local_decl() {
+        let stmt = Stmt::LocalDecl {
+            name: "x".to_string(),
+            expr: Expr::Int(5),
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "local x = 5");
+    }
+
+    #[test]
+    fn formats_assign() {
+        let stmt = Stmt::Assign {
+            name: "x".to_string(),
+            expr: Expr::Int(2),
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "x = 2");
+    }
+
+    #[test]
+    fn formats_return_some() {
+        let stmt = Stmt::Return(Some(Expr::Int(1)));
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "return 1");
+    }
+
+    #[test]
+    fn formats_return_none_emits_nothing() {
+        let stmt = Stmt::Return(None);
+        assert!(format_stmt(&stmt, 0).is_none());
+    }
+
+    #[test]
+    fn formats_if_then_with_indented_body() {
+        let stmt = Stmt::If {
+            cond: Expr::Global("x".to_string()),
+            then_body: vec![Stmt::Return(Some(Expr::Int(1)))],
+            else_body: None,
+        };
+        assert_eq!(
+            format_stmt(&stmt, 0).unwrap(),
+            "if x then\n    return 1\nend"
+        );
+    }
+
+    #[test]
+    fn formats_if_then_at_nonzero_indent() {
+        // Inside a then-body that itself contains an `if` (which
+        // Stage 7 doesn't recover, but the formatter must still
+        // handle the AST shape), the inner `if` indents further.
+        let inner = Stmt::If {
+            cond: Expr::Global("y".to_string()),
+            then_body: vec![Stmt::Return(Some(Expr::Int(2)))],
+            else_body: None,
+        };
+        assert_eq!(
+            format_stmt(&inner, 1).unwrap(),
+            "    if y then\n        return 2\n    end"
+        );
+    }
+
+    #[test]
+    fn emit_ast_joins_with_newline_no_trailing() {
+        let stmts = vec![
+            Stmt::LocalDecl {
+                name: "x".to_string(),
+                expr: Expr::Int(1),
             },
-            protos: vec![Proto {
-                flags: 0,
-                numparams: 0,
-                framesize: 1,
-                upvalues: Vec::<UpvalDesc>::new(),
-                gc_consts,
-                num_consts,
-                insts: vec![Instruction::synthetic_header(Opcode::Funcv, 1), load, ret],
-                debug: Some(DebugInfo {
-                    var_info: vec![named_local(0, name, 0, 1)],
-                    ..DebugInfo::default()
-                }),
-            }],
-        }
+            Stmt::Return(Some(Expr::Var("x".to_string()))),
+        ];
+        assert_eq!(emit_ast(&stmts), "local x = 1\nreturn x");
     }
 
     #[test]
-    fn emit_local_int() {
-        // `local x = 5; return x`: KSHORT 0 5; RET1 0 2 with var_info.
-        let load = Instruction {
-            op: Opcode::Kshort,
-            a: 0,
-            b_or_d: 5,
-            c: 0,
-        };
-        let ret = Instruction {
-            op: Opcode::Ret1,
-            a: 0,
-            b_or_d: 2,
-            c: 0,
-        };
-        let module = local_module(load, ret, "x", Vec::new(), Vec::new());
-        assert_eq!(emit_module(&module).unwrap(), "local x = 5\nreturn x");
-    }
-
-    #[test]
-    fn emit_local_no_return() {
-        // `local x = 5` with implicit return: KSHORT 0 5; RET0 0 1.
-        // The local's scope covers only instruction 0 (the load); the
-        // RET0 is the implicit end-of-chunk return.
-        let load = Instruction {
-            op: Opcode::Kshort,
-            a: 0,
-            b_or_d: 5,
-            c: 0,
-        };
-        let ret = Instruction {
-            op: Opcode::Ret0,
-            a: 0,
-            b_or_d: 1,
-            c: 0,
-        };
-        // Scope covers both instructions so var_name_at(load.a, 0)
-        // still resolves — matches the real luajit output, which has
-        // the local live through the RET0.
-        let module = Module {
-            header: ModuleHeader {
-                flags: 0,
-                chunkname: None,
+    fn emit_ast_skips_implicit_return() {
+        // Return(None) emits no line, so a chunk that ends in an
+        // implicit return joins to just the prior statements.
+        let stmts = vec![
+            Stmt::LocalDecl {
+                name: "x".to_string(),
+                expr: Expr::Int(5),
             },
-            protos: vec![Proto {
-                flags: 0,
-                numparams: 0,
-                framesize: 1,
-                upvalues: Vec::<UpvalDesc>::new(),
-                gc_consts: Vec::new(),
-                num_consts: Vec::new(),
-                insts: vec![Instruction::synthetic_header(Opcode::Funcv, 1), load, ret],
-                debug: Some(DebugInfo {
-                    var_info: vec![named_local(0, "x", 0, 1)],
-                    ..DebugInfo::default()
-                }),
-            }],
-        };
-        assert_eq!(emit_module(&module).unwrap(), "local x = 5");
-    }
-
-    #[test]
-    fn emit_local_str() {
-        // `local x = "foo"; return x`: KSTR 0 0; RET1 0 2 with var_info.
-        let load = Instruction {
-            op: Opcode::Kstr,
-            a: 0,
-            b_or_d: 0,
-            c: 0,
-        };
-        let ret = Instruction {
-            op: Opcode::Ret1,
-            a: 0,
-            b_or_d: 2,
-            c: 0,
-        };
-        let module = local_module(
-            load,
-            ret,
-            "x",
-            vec![GcConst::Str(b"foo".to_vec())],
-            Vec::new(),
-        );
-        assert_eq!(emit_module(&module).unwrap(), "local x = \"foo\"\nreturn x");
-    }
-
-    #[test]
-    fn emit_local_with_ret1_wrong_slot() {
-        // var_info names slot 0, but RET1 reads slot 1 — the return
-        // doesn't read the declared local, so this isn't the
-        // `local x = <const>; return x` shape.
-        let load = Instruction {
-            op: Opcode::Kshort,
-            a: 0,
-            b_or_d: 5,
-            c: 0,
-        };
-        let ret = Instruction {
-            op: Opcode::Ret1,
-            a: 1, // wrong slot
-            b_or_d: 2,
-            c: 0,
-        };
-        let module = local_module(load, ret, "x", Vec::new(), Vec::new());
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for RET1 reading wrong slot, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn emit_local_with_ret1_wrong_d() {
-        // RET1 D != 2 — not the single-value-return convention.
-        let load = Instruction {
-            op: Opcode::Kshort,
-            a: 0,
-            b_or_d: 5,
-            c: 0,
-        };
-        let ret = Instruction {
-            op: Opcode::Ret1,
-            a: 0,
-            b_or_d: 3, // wrong D
-            c: 0,
-        };
-        let module = local_module(load, ret, "x", Vec::new(), Vec::new());
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for RET1 with wrong D, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn emit_stage2_return_const_with_empty_var_info_still_works() {
-        // Regression: a Stage 2 module built without var_info must
-        // still take the `return <const>` path, NOT be mistaken for a
-        // local declaration. The `return_const_module` helper builds
-        // protos with `DebugInfo::default()` (empty var_info), so
-        // `var_name_at` returns None.
-        let load = Instruction {
-            op: Opcode::Kshort,
-            a: 0,
-            b_or_d: 5,
-            c: 0,
-        };
-        let module = return_const_module(load, Vec::new(), Vec::new());
-        assert_eq!(emit_module(&module).unwrap(), "return 5");
-    }
-
-    // ---- Stage 4: arithmetic expressions -----------------------------
-    //
-    // These build Modules by hand with the exact bytecode shapes
-    // `luajit -bl` produces for the corresponding source, then verify
-    // `emit_module` round-trips them. The walk must record each
-    // arithmetic result into `slot_exprs` WITHOUT emitting a line —
-    // the expression only surfaces at RET1.
-
-    /// Build a minimal Module whose main proto has the given real
-    /// instructions, debug var_info records, and constant tables.
-    /// Caller provides everything; this just wraps the boilerplate.
-    fn module_with(
-        real_insts: Vec<Instruction>,
-        var_info: Vec<crate::ir::VarInfo>,
-        gc_consts: Vec<GcConst>,
-        num_consts: Vec<NumConst>,
-        framesize: u8,
-    ) -> Module {
-        let mut insts = vec![Instruction::synthetic_header(Opcode::Funcv, framesize)];
-        insts.extend(real_insts);
-        Module {
-            header: ModuleHeader {
-                flags: 0,
-                chunkname: None,
-            },
-            protos: vec![Proto {
-                flags: 0,
-                numparams: 0,
-                framesize,
-                upvalues: Vec::<UpvalDesc>::new(),
-                gc_consts,
-                num_consts,
-                insts,
-                debug: Some(DebugInfo {
-                    var_info,
-                    ..DebugInfo::default()
-                }),
-            }],
-        }
-    }
-
-    /// Convenience: build an arithmetic instruction in ABC form.
-    fn abc(op: Opcode, a: u8, b: u8, c: u8) -> Instruction {
-        Instruction {
-            op,
-            a,
-            b_or_d: u32::from(b),
-            c,
-        }
-    }
-
-    /// Convenience: build an AD-format instruction (D = 16-bit
-    /// immediate / index).
-    fn ad(op: Opcode, a: u8, d: u16) -> Instruction {
-        Instruction {
-            op,
-            a,
-            b_or_d: u32::from(d),
-            c: 0,
-        }
-    }
-
-    #[test]
-    fn emit_arith_addvn() {
-        // `local a = 5; return a + 3`:
-        //   KSHORT 0 5; ADDVN 1 0 0; RET1 1 2.
-        // ADDVN: dest=A(1), left=reg[B](0)=a, right=num_const[C](0)=3.
-        let insts = vec![
-            ad(Opcode::Kshort, 0, 5),
-            abc(Opcode::Addvn, 1, 0, 0),
-            ad(Opcode::Ret1, 1, 2),
+            Stmt::Return(None),
         ];
-        let module = module_with(
-            insts,
-            vec![named_local(0, "a", 0, 2)],
-            Vec::new(),
-            vec![NumConst::Int(3)],
-            2,
-        );
-        assert_eq!(emit_module(&module).unwrap(), "local a = 5\nreturn a + 3");
+        assert_eq!(emit_ast(&stmts), "local x = 5");
     }
 
     #[test]
-    fn emit_arith_addnv() {
-        // `local a = 5; return 3 + a`:
-        //   KSHORT 0 5; ADDNV 1 0 0; RET1 1 2.
-        // ADDNV: dest=A(1), left=num_const[B](0)=3, right=reg[C](0)=a.
-        let insts = vec![
-            ad(Opcode::Kshort, 0, 5),
-            abc(Opcode::Addnv, 1, 0, 0),
-            ad(Opcode::Ret1, 1, 2),
-        ];
-        let module = module_with(
-            insts,
-            vec![named_local(0, "a", 0, 2)],
-            Vec::new(),
-            vec![NumConst::Int(3)],
-            2,
-        );
-        assert_eq!(emit_module(&module).unwrap(), "local a = 5\nreturn 3 + a");
-    }
-
-    #[test]
-    fn emit_arith_addvv_two_locals() {
-        // `local a = 1; local b = 2; return a + b`:
-        //   KSHORT 0 1; KSHORT 1 2; ADDVV 2 0 1; RET1 2 2.
-        let insts = vec![
-            ad(Opcode::Kshort, 0, 1),
-            ad(Opcode::Kshort, 1, 2),
-            abc(Opcode::Addvv, 2, 0, 1),
-            ad(Opcode::Ret1, 2, 2),
-        ];
-        let module = module_with(
-            insts,
-            vec![named_local(0, "a", 0, 3), named_local(1, "b", 1, 3)],
-            Vec::new(),
-            Vec::new(),
-            3,
-        );
-        assert_eq!(
-            emit_module(&module).unwrap(),
-            "local a = 1\nlocal b = 2\nreturn a + b"
-        );
-    }
-
-    #[test]
-    fn emit_arith_div_mod_mul_use_correct_symbols() {
-        // One test covering the symbol mapping for the non-ADD
-        // arithmetic ops via DIVVN/MODVN/MULVN. Stage 4 only emits
-        // single binops; the symbol is what differs.
-        let div_insts = vec![
-            ad(Opcode::Kshort, 0, 10),
-            abc(Opcode::Divvn, 1, 0, 0),
-            ad(Opcode::Ret1, 1, 2),
-        ];
-        let div_mod = module_with(
-            div_insts,
-            vec![named_local(0, "a", 0, 2)],
-            Vec::new(),
-            vec![NumConst::Int(3)],
-            2,
-        );
-        assert_eq!(emit_module(&div_mod).unwrap(), "local a = 10\nreturn a / 3");
-
-        let mul_insts = vec![
-            ad(Opcode::Kshort, 0, 10),
-            abc(Opcode::Mulvn, 1, 0, 0),
-            ad(Opcode::Ret1, 1, 2),
-        ];
-        let mul_mod = module_with(
-            mul_insts,
-            vec![named_local(0, "a", 0, 2)],
-            Vec::new(),
-            vec![NumConst::Int(3)],
-            2,
-        );
-        assert_eq!(emit_module(&mul_mod).unwrap(), "local a = 10\nreturn a * 3");
-
-        let mod_insts = vec![
-            ad(Opcode::Kshort, 0, 10),
-            abc(Opcode::Modvn, 1, 0, 0),
-            ad(Opcode::Ret1, 1, 2),
-        ];
-        let mod_mod = module_with(
-            mod_insts,
-            vec![named_local(0, "a", 0, 2)],
-            Vec::new(),
-            vec![NumConst::Int(3)],
-            2,
-        );
-        assert_eq!(emit_module(&mod_mod).unwrap(), "local a = 10\nreturn a % 3");
-    }
-
-    #[test]
-    fn emit_arith_pow() {
-        // `local a = 2; return a ^ 10`:
-        //   KSHORT 0 2; KSHORT 1 10; POW 1 0 1; RET1 1 2.
-        // POW has no VN/NV variants; the right operand is loaded into
-        // a register first, then POW takes reg[B], reg[C].
-        let insts = vec![
-            ad(Opcode::Kshort, 0, 2),
-            ad(Opcode::Kshort, 1, 10),
-            abc(Opcode::Pow, 1, 0, 1),
-            ad(Opcode::Ret1, 1, 2),
-        ];
-        let module = module_with(
-            insts,
-            vec![named_local(0, "a", 0, 3)],
-            Vec::new(),
-            Vec::new(),
-            2,
-        );
-        assert_eq!(emit_module(&module).unwrap(), "local a = 2\nreturn a ^ 10");
-    }
-
-    #[test]
-    fn emit_arith_cat_overwrites_source_slot() {
-        // `return "hello" .. " world"`:
-        //   KSTR 0 0; KSTR 1 1; CAT 0 0 1; RET1 0 2.
-        // CAT writes its result into slot 0 — the SAME slot that held
-        // the first KSTR operand. The walk must overwrite slot_exprs[0]
-        // with the concat result before RET1 reads it.
-        //
-        // KSTR uses reverse-index lookup (operand d -> gc_consts[len-1-d]):
-        //   operand 0 -> gc_consts[1] = "hello"
-        //   operand 1 -> gc_consts[0] = " world"
-        // so we store gc_consts in [world, hello] order on disk.
-        let insts = vec![
-            ad(Opcode::Kstr, 0, 0),
-            ad(Opcode::Kstr, 1, 1),
-            abc(Opcode::Cat, 0, 0, 1),
-            ad(Opcode::Ret1, 0, 2),
-        ];
-        let module = module_with(
-            insts,
-            Vec::new(),
-            vec![
-                GcConst::Str(b" world".to_vec()),
-                GcConst::Str(b"hello".to_vec()),
-            ],
-            Vec::new(),
-            2,
-        );
-        assert_eq!(
-            emit_module(&module).unwrap(),
-            "return \"hello\" .. \" world\""
-        );
-    }
-
-    #[test]
-    fn emit_arith_with_float_const_uses_lua_formatter() {
-        // `local a = ...; return a / 0.1` — the constant operand
-        // flows through format_lua_number. Use a value that would
-        // round differently under Rust's `{}`.
-        let insts = vec![
-            ad(Opcode::Kshort, 0, 1),
-            abc(Opcode::Divvn, 1, 0, 0),
-            ad(Opcode::Ret1, 1, 2),
-        ];
-        let module = module_with(
-            insts,
-            vec![named_local(0, "a", 0, 2)],
-            Vec::new(),
-            vec![NumConst::Num(10.0 / 3.0)],
-            2,
-        );
-        assert_eq!(
-            emit_module(&module).unwrap(),
-            "local a = 1\nreturn a / 3.3333333333333"
-        );
-    }
-
-    #[test]
-    fn emit_arithmetic_result_to_unread_slot_emits_nothing() {
-        // ADDVN writes to slot 1, but RET0 follows (no RET1 reads
-        // slot 1). The arithmetic still executes (no NotImplemented),
-        // but the dead result produces no emitted line.
-        let insts = vec![
-            ad(Opcode::Kshort, 0, 5),
-            abc(Opcode::Addvn, 1, 0, 0),
-            ad(Opcode::Ret0, 0, 1),
-        ];
-        let module = module_with(
-            insts,
-            vec![named_local(0, "a", 0, 2)],
-            Vec::new(),
-            vec![NumConst::Int(3)],
-            2,
-        );
-        assert_eq!(emit_module(&module).unwrap(), "local a = 5");
-    }
-
-    #[test]
-    fn emit_arithmetic_not_implemented_for_unsupported_opcode() {
-        // GGET (global get) isn't in the walk's match arms; the
-        // default case bails with NotImplemented.
-        let insts = vec![
-            ad(Opcode::Gget, 0, 0), // unsupported
-            ad(Opcode::Ret1, 0, 2),
-        ];
-        let module = module_with(insts, Vec::new(), Vec::new(), Vec::new(), 1);
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for GGET, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn emit_arithmetic_not_implemented_for_missing_operand_slot() {
-        // ADDVV reads slots 0 and 1, but only slot 0 has a recorded
-        // expression — slot 1 was never written by an instruction we
-        // handle. The walk's lookup_operand bails.
-        let insts = vec![
-            ad(Opcode::Kshort, 0, 1),
-            abc(Opcode::Addvv, 2, 0, 1), // slot 1 never populated
-            ad(Opcode::Ret1, 2, 2),
-        ];
-        let module = module_with(
-            insts,
-            vec![named_local(0, "a", 0, 2)],
-            Vec::new(),
-            Vec::new(),
-            3,
-        );
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for ADDVV with uninitialized slot 1, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn emit_arithmetic_not_implemented_for_missing_num_const() {
-        // ADDVN references num_const[0] but the proto has no
-        // num_consts table. format_num_const bails with NotImplemented.
-        let insts = vec![
-            ad(Opcode::Kshort, 0, 5),
-            abc(Opcode::Addvn, 1, 0, 0),
-            ad(Opcode::Ret1, 1, 2),
-        ];
-        let module = module_with(
-            insts,
-            vec![named_local(0, "a", 0, 2)],
-            Vec::new(),
-            Vec::new(), // no num_consts
-            2,
-        );
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for ADDVN with missing num_const, got {:?}",
-            result
-        );
-    }
-
-    // ---- Stage 5: named-local arithmetic + MOV ----------------------
-    //
-    // Stage 5 closes two gaps in the walk: arithmetic results that land
-    // in a named-local slot must emit `local <name> = <expr>` (and
-    // store the name), and `MOV A D` copies a slot's expression with
-    // the same named-local handling. The `assign_slot` helper
-    // centralizes both paths.
-
-    #[test]
-    fn emit_named_local_arithmetic() {
-        // `local a = 1; local b = a + 2; return b`:
-        //   KSHORT 0 1; ADDVN 1 0 0; RET1 1 2.
-        // The ADDVN result lands in slot 1, which var_info names "b"
-        // at instruction index 1. Without the named-local check the
-        // walk would record "a + 2" as a temporary and emit
-        // `return a + 2`, dropping the `local b` declaration.
-        let insts = vec![
-            ad(Opcode::Kshort, 0, 1),
-            abc(Opcode::Addvn, 1, 0, 0),
-            ad(Opcode::Ret1, 1, 2),
-        ];
-        let module = module_with(
-            insts,
-            vec![named_local(0, "a", 0, 2), named_local(1, "b", 1, 2)],
-            Vec::new(),
-            vec![NumConst::Int(2)],
-            2,
-        );
-        assert_eq!(
-            emit_module(&module).unwrap(),
-            "local a = 1\nlocal b = a + 2\nreturn b"
-        );
-    }
-
-    #[test]
-    fn emit_mov_to_named_local() {
-        // `local a = 1; local b = a; return b`:
-        //   KSHORT 0 1; MOV 1 0; RET1 1 2.
-        // MOV is AD format: A=dest, D=source register. The destination
-        // slot 1 is named "b" at instruction 1, so the walk emits a
-        // declaration and stores the name (which RET1 surfaces).
-        let insts = vec![
-            ad(Opcode::Kshort, 0, 1),
-            ad(Opcode::Mov, 1, 0),
-            ad(Opcode::Ret1, 1, 2),
-        ];
-        let module = module_with(
-            insts,
-            vec![named_local(0, "a", 0, 2), named_local(1, "b", 1, 2)],
-            Vec::new(),
-            Vec::new(),
-            2,
-        );
-        assert_eq!(
-            emit_module(&module).unwrap(),
-            "local a = 1\nlocal b = a\nreturn b"
-        );
-    }
-
-    #[test]
-    fn emit_mov_to_temporary() {
-        // `local a = 5` followed by an unnamed MOV into slot 1 and
-        // RET1 reading slot 1. Slot 1 has NO var_info entry, so the
-        // MOV stores the source's expression ("a") as an unnamed
-        // temporary; no `local` line is emitted. RET1 then surfaces
-        // the temporary expression.
-        let insts = vec![
-            ad(Opcode::Kshort, 0, 5),
-            ad(Opcode::Mov, 1, 0),
-            ad(Opcode::Ret1, 1, 2),
-        ];
-        let module = module_with(
-            insts,
-            vec![named_local(0, "a", 0, 2)],
-            Vec::new(),
-            Vec::new(),
-            2,
-        );
-        assert_eq!(emit_module(&module).unwrap(), "local a = 5\nreturn a");
-    }
-
-    #[test]
-    fn emit_mov_not_implemented_for_uninitialized_source() {
-        // MOV reads slot 0, but no prior instruction populated it.
-        // The walk bails rather than fabricating an expression.
-        let insts = vec![
-            ad(Opcode::Mov, 1, 0), // slot 0 never written
-            ad(Opcode::Ret1, 1, 2),
-        ];
-        let module = module_with(insts, Vec::new(), Vec::new(), Vec::new(), 2);
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for MOV with uninitialized source, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn emit_arith_unnamed_temporary_preserved_after_assign_slot_refactor() {
-        // Stage 4 regression: `local a = 1; local b = 2; return a + b`
-        // has the ADDVV result land in slot 2, which has NO var_info
-        // entry (no `local c` in the source). `var_name_at(2, 2)`
-        // returns None, so assign_slot stores "a + b" as an unnamed
-        // temporary and emits no line. RET1 surfaces it as a return.
-        // The refactored arithmetic arms must not regress this case.
-        let insts = vec![
-            ad(Opcode::Kshort, 0, 1),
-            ad(Opcode::Kshort, 1, 2),
-            abc(Opcode::Addvv, 2, 0, 1),
-            ad(Opcode::Ret1, 2, 2),
-        ];
-        let module = module_with(
-            insts,
-            vec![named_local(0, "a", 0, 3), named_local(1, "b", 1, 3)],
-            Vec::new(),
-            Vec::new(),
-            3,
-        );
-        assert_eq!(
-            emit_module(&module).unwrap(),
-            "local a = 1\nlocal b = 2\nreturn a + b"
-        );
-    }
-
-    #[test]
-    fn emit_walk_regression_stage1_ret0_only() {
-        // Stage 1 regression: a single RET0 still emits empty source
-        // through the new walk.
-        let module = module_with(
-            vec![ad(Opcode::Ret0, 0, 1)],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            1,
-        );
-        assert_eq!(emit_module(&module).unwrap(), "");
-    }
-
-    #[test]
-    fn emit_walk_regression_stage2_return_const() {
-        // Stage 2 regression: transient KSHORT into r0, then RET1.
-        let module = module_with(
-            vec![ad(Opcode::Kshort, 0, 5), ad(Opcode::Ret1, 0, 2)],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            1,
-        );
-        assert_eq!(emit_module(&module).unwrap(), "return 5");
-    }
-
-    #[test]
-    fn emit_walk_regression_no_return_after_load() {
-        // A load with no following RET0/RET1: walk falls off the end
-        // with saw_return=false -> NotImplemented.
-        let module = module_with(
-            vec![ad(Opcode::Kshort, 0, 5)],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            1,
-        );
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for chunk without return, got {:?}",
-            result
-        );
-    }
-
-    // ---- Stage 6: local reassignment -------------------------------
-    //
-    // A second store to a slot whose variable is already in scope
-    // must emit `<name> = <expr>` (no `local`), not re-declare the
-    // variable. The bytecode shape is identical to a multi-declaration
-    // sequence — the only difference is the var_info's `scope_begin`.
-    // A single record spanning multiple stores is what `luajit -bl`
-    // produces for `local a = 1; a = 2`.
-
-    #[test]
-    fn emit_reassignment_omits_local_keyword() {
-        // `local a = 1; a = 2; return a`:
-        //   KSHORT 0 1; KSHORT 0 2; RET1 0 2.
-        // var_info has ONE record (slot 0, "a", scope [0, 2]) — both
-        // KSHORT stores target the same variable. The first store is
-        // at instruction 0 == scope_begin, so it's a declaration; the
-        // second is at instruction 1 != scope_begin, so it's a
-        // reassignment and must omit `local`.
-        let insts = vec![
-            ad(Opcode::Kshort, 0, 1),
-            ad(Opcode::Kshort, 0, 2),
-            ad(Opcode::Ret1, 0, 2),
-        ];
-        let module = module_with(
-            insts,
-            vec![named_local(0, "a", 0, 2)],
-            Vec::new(),
-            Vec::new(),
-            1,
-        );
-        assert_eq!(
-            emit_module(&module).unwrap(),
-            "local a = 1\na = 2\nreturn a"
-        );
-    }
-
-    #[test]
-    fn emit_reassignment_with_arith() {
-        // `local a = 1; a = a + 1; return a`:
-        //   KSHORT 0 1; ADDVN 0 0 0; RET1 0 2.
-        // ADDVN reads slot 0 (resolving the left operand to "a" via
-        // the prior KSHORT's stored name) and writes back to slot 0.
-        // The write is at instruction 1, past scope_begin 0, so the
-        // walk emits `a = a + 1` (no `local`). This case matters
-        // because the same instruction reads AND writes the slot —
-        // the left operand must be resolved before the slot is
-        // overwritten with the new expression.
-        let insts = vec![
-            ad(Opcode::Kshort, 0, 1),
-            abc(Opcode::Addvn, 0, 0, 0),
-            ad(Opcode::Ret1, 0, 2),
-        ];
-        let module = module_with(
-            insts,
-            vec![named_local(0, "a", 0, 2)],
-            Vec::new(),
-            vec![NumConst::Int(1)],
-            1,
-        );
-        assert_eq!(
-            emit_module(&module).unwrap(),
-            "local a = 1\na = a + 1\nreturn a"
-        );
+    fn emit_ast_empty_returns_empty() {
+        // A chunk that's just `return` (RET0 only) round-trips to
+        // empty source — both the implicit Return(None) and the
+        // empty AST produce the same output.
+        assert_eq!(emit_ast(&[]), "");
+        assert_eq!(emit_ast(&[Stmt::Return(None)]), "");
     }
 }

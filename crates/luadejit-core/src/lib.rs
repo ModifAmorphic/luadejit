@@ -1,13 +1,13 @@
 //! luadejit-core: LuaJIT bytecode decompiler library.
 //!
 //! The pipeline is: parse bytecode ([`ir::Module::from_bytes`])
-//! → emit source ([`emit::emit_module`]). Higher-level stages of the
-//! implementation plan (CFG, SSA, structural recovery, etc.) slot in
-//! between these two steps in later work. Currently handles the
-//! Stage 1 RET0-only case (empty source), the Stage 2
-//! `return <const>` case (integer/number/string/bool/nil constants),
-//! and the Stage 3 `local x = <const>` case (single local declaration
-//! that may be returned); anything else returns
+//! → CFG ([`cfg::Cfg::build`]) → structural recovery
+//! ([`structure::recover`]) → emit source ([`emit::emit_module`]).
+//! Stage 7 connects the CFG infrastructure (Stages 7a/7b) to the
+//! emitter by routing every decompilation through the AST:
+//! linear code (Stages 1-6 shapes) round-trips unchanged, and the
+//! new capability is `if x then return 1 end` (Stage 7c-7e).
+//! Anything not yet handled returns
 //! [`DecompilerError::NotImplemented`].
 
 pub mod cfg;
@@ -15,6 +15,7 @@ pub mod emit;
 pub mod frontend;
 pub mod ir;
 pub mod number;
+pub mod structure;
 
 use ir::Module;
 
