@@ -8,15 +8,18 @@
 //!   `Return`. Produces a flat list of statements. This is what
 //!   Stages 1-6 produced via the walk-based emitter; the new pipeline
 //!   emits identical source through the AST.
-//! - **Single `if/then`**: an entry block ending in
-//!   [`ConditionalBranch`](crate::cfg::Terminator::ConditionalBranch)
+//! - **Single `if` (with optional `else`)**: an entry block ending
+//!   in [`ConditionalBranch`](crate::cfg::Terminator::ConditionalBranch)
 //!   (ISF or IST + JMP), with a then-body that either returns or
-//!   falls through to a post-`if` merge block. The continuation after
-//!   the `if` is also recovered (typically a final `return`).
+//!   falls through to a post-`if` merge block. Stage 7 covered the
+//!   no-`else` case; Stage 8 adds the `else` branch via the
+//!   "skip-else" JMP that LuaJIT's codegen always emits between
+//!   the two bodies. The continuation after the `if` is also
+//!   recovered (typically a final `return`).
 //!
-//! Everything else (if/else, loops, function calls, nested `if`,
-//! compound conditions) bails with [`DecompilerError::NotImplemented`]
-//! — Stage 8 and later pick those up.
+//! Everything else (loops, function calls, nested `if`, compound
+//! conditions, `elseif` chains) bails with
+//! [`DecompilerError::NotImplemented`] — later stages pick those up.
 //!
 //! ## Slot → Expr tracking
 //!
@@ -32,12 +35,16 @@
 //!   `Expr::Var(name)`, emit `name = expr` (no `local`).
 //! - Unnamed temp → store the computed `Expr`, emit no line.
 //!
-//! The slot map is threaded through `if/then` recovery unchanged.
-//! Both branches agree on the variable *name* (it's the same local
-//! in scope), so reading the slot after the merge surfaces the right
-//! name. Value reconciliation across branches is phi-elimination
-//! territory (Stage 8+); Stage 7 doesn't need it because the
-//! supported fixtures don't introduce merge-time conflicts.
+//! The slot map is snapshotted before each branch body and restored
+//! between bodies, so the then-body and else-body each see the
+//! entry-block state in isolation. At the merge, the map reflects
+//! whichever branch was processed last (the else-body, when there is
+//! one). For named locals this is correct — both branches agree on
+//! the name — so `return <name>` at the merge references the right
+//! local. Value reconciliation for unnamed temps across merges is
+//! phi-elimination territory (later stages); Stage 8 doesn't need it
+//! because the supported fixtures don't introduce merge-time
+//! conflicts.
 
 use std::collections::HashMap;
 
@@ -58,8 +65,8 @@ pub enum Stmt {
     /// line; the source chunk just ends).
     Return(Option<Expr>),
     /// `if cond then then_body end` (with an optional `else` body —
-    /// Stage 7 always emits `else_body: None`; the variant is here
-    /// so later stages don't have to retread emit's match arms).
+    /// Stage 7 emits `else_body: None`; Stage 8 populates it for the
+    /// `if/else` shape).
     If {
         cond: Expr,
         then_body: Vec<Stmt>,
@@ -132,32 +139,32 @@ pub enum BinOpKind {
 ///
 /// Walks the CFG starting at the entry block, threading a
 /// `slot_exprs` map and producing [`Stmt`] nodes. Returns
-/// [`DecompilerError::NotImplemented`] for any CFG shape Stage 7
-/// doesn't model: if/else, compound conditions, loops, function
-/// calls, tail calls, nested `if`, and any block whose terminator
-/// isn't `Return`, `Fallthrough`, or a single `ConditionalBranch`.
+/// [`DecompilerError::NotImplemented`] for any CFG shape Stage 8
+/// doesn't model: more than one `ConditionalBranch` (nested `if`,
+/// `elseif` chains, sequential `if`s), compound conditions, loops,
+/// function calls, tail calls, and any block whose terminator isn't
+/// `Return`, `Fallthrough`, or a single `ConditionalBranch`.
+///
+/// Unreachable blocks (e.g. the dead "skip-else" JMP LuaJIT emits
+/// after a returning then-body) are *not* rejected wholesale — they
+/// are part of the if/else structural signature. The walk simply
+/// never enters them: the recovery uses the dead JMP only to
+/// identify the merge target, never to process its instructions.
 pub fn recover(proto: &Proto, cfg: &Cfg) -> Result<Vec<Stmt>, DecompilerError> {
     if cfg.blocks.is_empty() {
         return Ok(Vec::new());
     }
-    // Stage 7 supports at most one ConditionalBranch per function —
-    // nested `if` and sequential `if`s both need Stage 8+ (else
-    // branches, scope-aware recovery). Counting up front keeps the
-    // walk simple: it doesn't have to track depth or sequence.
+    // Stage 7-8 support at most one ConditionalBranch per function —
+    // nested `if`, `elseif` chains, and sequential `if`s all need
+    // later stages (scope-aware recovery, structural analysis for
+    // chained `if`s). Counting up front keeps the walk simple: it
+    // doesn't have to track depth or sequence.
     let conditional_branches = cfg
         .blocks
         .iter()
         .filter(|b| matches!(b.terminator, Terminator::ConditionalBranch { .. }))
         .count();
     if conditional_branches > 1 {
-        return Err(DecompilerError::NotImplemented);
-    }
-    // if/else codegen produces an unreachable dead-jump block (the
-    // JMP after the then-body's RET1) plus an unreachable merge (its
-    // target). Stage 7 if/then has no unreachable blocks; bailing
-    // here keeps the walk from misreading an else-body as the
-    // post-`if` continuation.
-    if !all_blocks_reachable(cfg) {
         return Err(DecompilerError::NotImplemented);
     }
     let mut slot_exprs: HashMap<u8, Expr> = HashMap::new();
@@ -171,29 +178,6 @@ pub fn recover(proto: &Proto, cfg: &Cfg) -> Result<Vec<Stmt>, DecompilerError> {
     Ok(stmts)
 }
 
-/// Whether every block in `cfg` is reachable from the entry via some
-/// control-flow path. Computed by an iterative DFS over successor
-/// edges. Used by [`recover`] to reject CFGs with dead blocks (the
-/// structural signature of if/else codegen).
-fn all_blocks_reachable(cfg: &Cfg) -> bool {
-    let n = cfg.blocks.len();
-    if n == 0 {
-        return true;
-    }
-    let mut visited = vec![false; n];
-    let mut stack: Vec<BlockId> = vec![cfg.entry];
-    visited[cfg.entry.0 as usize] = true;
-    while let Some(b) = stack.pop() {
-        for (succ, _) in &cfg.blocks[b.0 as usize].succs {
-            if !visited[succ.0 as usize] {
-                visited[succ.0 as usize] = true;
-                stack.push(*succ);
-            }
-        }
-    }
-    visited.iter().all(|v| *v)
-}
-
 /// Walk-time shared state. Borrows the proto + cfg immutably and the
 /// slot map mutably for the duration of recovery. The lifetime is
 /// kept internal to this module: callers go through [`recover`].
@@ -204,7 +188,9 @@ struct RecoveryCtx<'a> {
 }
 
 /// Walk a chain of blocks starting at `start`, appending [`Stmt`]s
-/// to `stmts`.
+/// to `stmts`. Returns the id of the last block examined — used by
+/// the caller to detect whether the branch body ended with a
+/// "skip-else" JMP (the if/else signature).
 ///
 /// `stop_at_merge` controls how a [`Terminator::Fallthrough`] into a
 /// block with multiple predecessors is treated:
@@ -212,21 +198,29 @@ struct RecoveryCtx<'a> {
 /// - `false` (top-level walk / post-`if` continuation): follow into
 ///   the merge. This is how the post-`if` continuation block (which
 ///   has preds from both branches) gets processed.
-/// - `true` (inside a then-body): stop at the merge. The
-///   then-body's fallthrough into the merge is *not* part of the
-///   then-body's source; the merge belongs to the outer walk.
+/// - `true` (inside a branch body): stop at the merge. The branch
+///   body's fallthrough into the merge is *not* part of the branch
+///   body's source; the merge belongs to the outer walk.
 ///
-/// Encountering a [`Terminator::Jump`] or [`Terminator::TailCall`]
-/// (or any unrecognized terminator instruction) bails with
-/// [`DecompilerError::NotImplemented`].
+/// When `stop_at_merge` is true the walk also stops (rather than
+/// bailing) on a [`Terminator::Jump`] — this is the live "skip-else"
+/// JMP at the end of a then-body that doesn't return (Stage 8
+/// if/else fallthrough). Top-level walks (`stop_at_merge == false`)
+/// still bail on Jump, since a standalone JMP at the top level is a
+/// loop or goto (later stages).
+///
+/// Encountering a [`Terminator::TailCall`] (or any unrecognized
+/// terminator) bails with [`DecompilerError::NotImplemented`].
 fn recover_from(
     start: BlockId,
     stop_at_merge: bool,
     ctx: &mut RecoveryCtx,
     stmts: &mut Vec<Stmt>,
-) -> Result<(), DecompilerError> {
+) -> Result<BlockId, DecompilerError> {
     let mut current = Some(start);
+    let mut last_block = start;
     while let Some(block_id) = current {
+        last_block = block_id;
         let block = &ctx.cfg.blocks[block_id.0 as usize];
         match block.terminator {
             Terminator::Return => {
@@ -250,12 +244,38 @@ fn recover_from(
                     process_inst(ctx, stmts, *inst_id)?;
                 }
                 if stop_at_merge && ctx.cfg.blocks[next.0 as usize].preds.len() > 1 {
-                    // The then-body falls through into the post-`if`
+                    // The branch body falls through into the post-`if`
                     // merge. Stop here — the merge belongs to the
-                    // outer walk, not the then-body.
+                    // outer walk, not the branch body.
                     break;
                 }
                 current = Some(next);
+            }
+            Terminator::Jump(target) => {
+                // Process every instruction in the block except the
+                // trailing JMP itself (the JMP is a "skip-else" or a
+                // goto, not source). When the block is a standalone
+                // JMP with no preceding instructions, this loop is a
+                // no-op.
+                let last_idx = block.insts.last().map(|id| id.0 as usize).unwrap();
+                for inst_id in &block.insts {
+                    if (inst_id.0 as usize) == last_idx {
+                        break;
+                    }
+                    process_inst(ctx, stmts, *inst_id)?;
+                }
+                if stop_at_merge {
+                    // Inside a branch body, a Jump terminator is the
+                    // live "skip-else" JMP — the then-body jumps over
+                    // the else-body to the merge. Stop without
+                    // advancing; the caller uses `target` to identify
+                    // the merge via [`branch_shape`].
+                    break;
+                }
+                // Top-level standalone JMP (loops, gotos) isn't
+                // supported.
+                let _ = target;
+                return Err(DecompilerError::NotImplemented);
             }
             Terminator::ConditionalBranch {
                 condition,
@@ -299,23 +319,108 @@ fn recover_from(
                     Opcode::Ist => Expr::Not(Box::new(cond_expr)),
                     _ => return Err(DecompilerError::NotImplemented),
                 };
+                // Snapshot the entry-block slot state so each branch
+                // body starts from the same baseline. The else-body
+                // (and the post-`if` merge, for if/then) is processed
+                // after restoring this snapshot.
+                let entry_slots = ctx.slot_exprs.clone();
                 let mut then_body: Vec<Stmt> = Vec::new();
-                recover_from(false_edge, true, ctx, &mut then_body)?;
+                let then_last = recover_from(false_edge, true, ctx, &mut then_body)?;
+                // Detect if/then vs if/else from the then-body's
+                // terminal block, and identify the merge.
+                let (else_start, merge) = branch_shape(ctx.cfg, then_last, true_edge)?;
+                let else_body = if let Some(else_start) = else_start {
+                    // if/else: process the else-body from the entry
+                    // slot state (the then-body's writes don't apply
+                    // when the else-branch runs).
+                    *ctx.slot_exprs = entry_slots.clone();
+                    let mut else_stmts: Vec<Stmt> = Vec::new();
+                    recover_from(else_start, true, ctx, &mut else_stmts)?;
+                    Some(else_stmts)
+                } else {
+                    // if/then: restore entry slots for the merge so
+                    // the then-body's writes don't leak past the
+                    // conditional (when the condition is false the
+                    // then-body didn't run).
+                    *ctx.slot_exprs = entry_slots.clone();
+                    None
+                };
                 stmts.push(Stmt::If {
                     cond: if_cond,
                     then_body,
-                    else_body: None,
+                    else_body,
                 });
-                current = Some(true_edge);
+                current = Some(merge);
             }
-            Terminator::Jump(_) | Terminator::TailCall(_) => {
-                // Standalone JMP (loops, gotos) and tail calls aren't
-                // Stage 7 territory.
+            Terminator::TailCall(_) => {
+                // Tail calls aren't supported.
                 return Err(DecompilerError::NotImplemented);
             }
         }
     }
-    Ok(())
+    Ok(last_block)
+}
+
+/// Decide whether the construct recovered from a
+/// [`Terminator::ConditionalBranch`] is an `if/then` or an `if/else`,
+/// and identify the merge block where control flow reconverges.
+///
+/// Returns `(else_start, merge)`:
+/// - `else_start == Some(block)` → if/else; `block` is the else-body's
+///   entry, `merge` is the post-`if` continuation.
+/// - `else_start == None` → if/then; `merge` is the post-`if`
+///   continuation (the entry's `true_edge`, where the ISxx+JMP lands
+///   when the condition skips the then-body).
+///
+/// # Detection algorithm
+///
+/// LuaJIT's codegen for `if/else` always emits a "skip-else" JMP
+/// between the two bodies. Its placement depends on whether the
+/// then-body returns:
+///
+/// 1. **Then-body ends with `Jump(merge)`** — the then-body falls
+///    through (doesn't return) and ends with the LIVE "skip-else"
+///    JMP over the else-body. `true_edge` is the else-body. →
+///    if/else.
+/// 2. **Then-body ends with `Fallthrough(target)`** — the then-body
+///    falls through into a merge that has multiple predecessors (the
+///    walk only stops at such a fallthrough when `stop_at_merge` is
+///    set). `target` is the merge. → if/then (no skip-else JMP
+///    exists).
+/// 3. **Then-body ends with `Return`** — the then-body returns. Look
+///    for a dead `Jump(merge)` block immediately after the then-body
+///    (by block id): LuaJIT emits this dead "skip-else" JMP even
+///    though the RET1 makes it unreachable. If found → if/else
+///    (`true_edge` is the else-body). If not found → if/then
+///    (`true_edge` is the merge).
+///
+/// Any other terminator shape is unsupported (Stage 8+).
+fn branch_shape(
+    cfg: &Cfg,
+    then_last: BlockId,
+    true_edge: BlockId,
+) -> Result<(Option<BlockId>, BlockId), DecompilerError> {
+    let last = &cfg.blocks[then_last.0 as usize];
+    match last.terminator {
+        Terminator::Jump(merge) => Ok((Some(true_edge), merge)),
+        Terminator::Fallthrough(target) => Ok((None, target)),
+        Terminator::Return => {
+            // Look for a dead "skip-else" JMP block immediately
+            // after the then-body. The walk never enters this block
+            // (it's unreachable after the RET1), but its presence —
+            // and its target — are the if/else signature.
+            let next_id = BlockId(then_last.0 + 1);
+            if (next_id.0 as usize) < cfg.blocks.len() {
+                if let Terminator::Jump(merge) = cfg.blocks[next_id.0 as usize].terminator {
+                    return Ok((Some(true_edge), merge));
+                }
+            }
+            // No dead JMP → if/then; the entry's true_edge is the
+            // merge.
+            Ok((None, true_edge))
+        }
+        _ => Err(DecompilerError::NotImplemented),
+    }
 }
 
 /// Process the trailing RET* instruction at absolute index `idx`.
@@ -1621,18 +1726,20 @@ mod tests {
         );
     }
 
-    /// If/else is Stage 8. The recovery should bail when it sees an
-    /// else branch (i.e. when the then-body returns but the
-    /// ConditionalBranch's true_edge leads to code that's not the
-    /// implicit-return merge).
+    /// `if x then return 1 else return 2 end` — the canonical
+    /// Stage 8 if/else fixture (both branches return). Bytecode:
+    ///   GGET 0 0; ISF 0; JMP => 0007;
+    ///   KSHORT 0 1; RET1;          (then-body, returns)
+    ///   JMP => 0009;               (dead jump after RET1)
+    ///   KSHORT 0 2; RET1;          (else-body, returns)
+    ///   RET0 0 1.                  (merge: implicit return)
+    ///
+    /// The dead JMP at idx 6 is unreachable (the RET1 already
+    /// returned), but LuaJIT always emits it as part of the
+    /// if/else codegen pattern. [`branch_shape`] uses it to identify
+    /// the merge; the recovery never processes its instructions.
     #[test]
-    fn recover_if_then_else_is_not_supported() {
-        // Bytecode (matches the cfg test fixture):
-        //   GGET 0 0; ISF 0; JMP => 0007;
-        //   KSHORT 0 1; RET1;          (then-body, returns)
-        //   JMP => 0009;               (dead jump after RET1)
-        //   KSHORT 0 2; RET1;          (else-body, returns)
-        //   RET0 0 1.                  (merge)
+    fn recover_if_else_both_return() {
         let insts = vec![
             ad(Opcode::Gget, 0, 0),     // idx 1
             ad(Opcode::Isf, 0, 0),      // idx 2
@@ -1651,17 +1758,264 @@ mod tests {
             Vec::new(),
             1,
         );
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for if/else, got {:?}",
-            result
+        assert_eq!(
+            emit(&module),
+            "if x then\n    return 1\nelse\n    return 2\nend"
         );
     }
 
+    /// Same fixture recovered directly to AST (not via emit_module).
+    /// Verifies the Stmt tree shape:
+    ///   If { cond: Global("x"),
+    ///       then_body: [Return(Some(Int(1)))],
+    ///       else_body: Some([Return(Some(Int(2)))]) }
+    /// The merge's implicit RET0 produces no Stmt.
+    #[test]
+    fn recover_if_else_both_return_ast_shape() {
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),     // idx 1
+            ad(Opcode::Isf, 0, 0),      // idx 2
+            ad(Opcode::Jmp, 1, 0x8003), // idx 3
+            ad(Opcode::Kshort, 0, 1),   // idx 4
+            ad(Opcode::Ret1, 0, 2),     // idx 5
+            ad(Opcode::Jmp, 0, 0x8002), // idx 6: dead
+            ad(Opcode::Kshort, 0, 2),   // idx 7
+            ad(Opcode::Ret1, 0, 2),     // idx 8
+            ad(Opcode::Ret0, 0, 1),     // idx 9
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"x".to_vec())],
+            Vec::new(),
+            1,
+        );
+        let proto = module.main_proto();
+        let cfg = Cfg::build(proto);
+        let ast = recover(proto, &cfg).expect("recover should succeed");
+
+        assert_eq!(ast.len(), 1, "expected just [If] (implicit RET0 → no Stmt)");
+        match &ast[0] {
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                assert_eq!(*cond, Expr::Global("x".to_string()), "cond");
+                assert_eq!(then_body.len(), 1, "then_body len");
+                match &then_body[0] {
+                    Stmt::Return(Some(expr)) => {
+                        assert_eq!(*expr, Expr::Int(1), "then return expr");
+                    }
+                    other => panic!("expected Return(Some(Int(1))), got {:?}", other),
+                }
+                let else_stmts = else_body.as_ref().expect("else_body should be populated");
+                assert_eq!(else_stmts.len(), 1, "else_body len");
+                match &else_stmts[0] {
+                    Stmt::Return(Some(expr)) => {
+                        assert_eq!(*expr, Expr::Int(2), "else return expr");
+                    }
+                    other => panic!("expected Return(Some(Int(2))), got {:?}", other),
+                }
+            }
+            other => panic!("expected If, got {:?}", other),
+        }
+    }
+
+    /// `local y = 0; if x then y = 1 else y = 2 end; return y` —
+    /// the if/else fallthrough fixture (both branches fall through
+    /// to the merge). Bytecode:
+    ///   KSHORT 0 0; GGET 1 0; ISF 1; JMP => 0007;
+    ///   KSHORT 0 1; JMP => 0008;       (then-body, LIVE skip-else)
+    ///   KSHORT 0 2;                    (else-body)
+    ///   RET1 0 2.                      (merge: return y)
+    ///
+    /// Exercises:
+    /// 1. The live "skip-else" JMP at the end of the then-body
+    ///    ([`Terminator::Jump`] with `stop_at_merge == true`).
+    /// 2. The else-body falling through into a merge with two preds.
+    /// 3. Slot tracking across branches: both branches reassign
+    ///    slot 0 to `Var("y")`, so the merge's `RET1 0 2` reads
+    ///    `Var("y")` and emits `return y`.
+    #[test]
+    fn recover_if_else_fallthrough() {
+        let insts = vec![
+            ad(Opcode::Kshort, 0, 0),   // idx 1 — y = 0
+            ad(Opcode::Gget, 1, 0),     // idx 2 — load x
+            ad(Opcode::Isf, 0, 1),      // idx 3 — tests slot 1 (x)
+            ad(Opcode::Jmp, 2, 0x8002), // idx 4: target = idx 7 (else)
+            ad(Opcode::Kshort, 0, 1),   // idx 5 — then: y = 1
+            ad(Opcode::Jmp, 1, 0x8001), // idx 6: target = idx 8 (merge)
+            ad(Opcode::Kshort, 0, 2),   // idx 7 — else: y = 2
+            ad(Opcode::Ret1, 0, 2),     // idx 8 — merge: return y
+        ];
+        let module = module_with(
+            insts,
+            // y is declared at real-idx 0 (the first KSHORT); scope
+            // covers the whole chunk so both then-body and else-body
+            // KSHORTs read as reassignments.
+            vec![named_local(0, "y", 0, 7)],
+            vec![GcConst::Str(b"x".to_vec())],
+            Vec::new(),
+            2,
+        );
+        assert_eq!(
+            emit(&module),
+            "local y = 0\nif x then\n    y = 1\nelse\n    y = 2\nend\nreturn y"
+        );
+    }
+
+    /// The detection algorithm ([`branch_shape`]) must distinguish
+    /// if/then from if/else based on the then-body's terminal
+    /// block. This test exercises all four detection paths directly:
+    ///
+    /// 1. **If/else via live Jump**: then-body's terminator is
+    ///    `Jump(merge)` → if/else, merge = Jump target.
+    /// 2. **If/else via dead Jump**: then-body's terminator is
+    ///    `Return`, and the block immediately after has `Jump(merge)`
+    ///    → if/else, merge = dead Jump target.
+    /// 3. **If/then via Return (no dead Jump)**: then-body's
+    ///    terminator is `Return`, no dead Jump follows → if/then,
+    ///    merge = entry's true_edge.
+    /// 4. **If/then via Fallthrough**: then-body's terminator is
+    ///    `Fallthrough(merge)` → if/then, merge = fallthrough target.
+    #[test]
+    fn recover_if_else_detection() {
+        // Case 1: live Jump (if/else fallthrough). Build the CFG
+        // directly and call branch_shape.
+        //   KSHORT 0 0; GGET 1 0; ISF 1; JMP => 0007;  (entry)
+        //   KSHORT 0 1; JMP => 0008;                  (then-body, Jump)
+        //   KSHORT 0 2;                               (else-body)
+        //   RET1 0 2.                                 (merge)
+        let cfg = Cfg::build(&Proto {
+            flags: 0,
+            numparams: 0,
+            framesize: 2,
+            upvalues: Vec::new(),
+            gc_consts: vec![GcConst::Str(b"x".to_vec())],
+            num_consts: Vec::new(),
+            insts: {
+                let mut v = vec![Instruction::synthetic_header(Opcode::Funcv, 2)];
+                v.extend([
+                    ad(Opcode::Kshort, 0, 0),
+                    ad(Opcode::Gget, 1, 0),
+                    ad(Opcode::Isf, 0, 1),
+                    ad(Opcode::Jmp, 2, 0x8002),
+                    ad(Opcode::Kshort, 0, 1),
+                    ad(Opcode::Jmp, 1, 0x8001),
+                    ad(Opcode::Kshort, 0, 2),
+                    ad(Opcode::Ret1, 0, 2),
+                ]);
+                v
+            },
+            debug: None,
+        });
+        // entry = Block 0, then-body = Block 1, else-body = Block 2,
+        // merge = Block 3. Then-body's terminator is Jump(Block 3).
+        let (else_start, merge) = branch_shape(&cfg, BlockId(1), BlockId(2)).unwrap();
+        assert_eq!(else_start, Some(BlockId(2)), "live Jump → if/else");
+        assert_eq!(merge, BlockId(3), "merge = Jump target");
+
+        // Case 2: dead Jump (if/else both return). Build the CFG.
+        //   GGET 0 0; ISF 0; JMP => 0007;  (entry)
+        //   KSHORT 0 1; RET1;              (then-body, Return)
+        //   JMP => 0009;                   (dead Jump)
+        //   KSHORT 0 2; RET1;              (else-body)
+        //   RET0 0 1.                      (merge)
+        let cfg = Cfg::build(&Proto {
+            flags: 0,
+            numparams: 0,
+            framesize: 1,
+            upvalues: Vec::new(),
+            gc_consts: vec![GcConst::Str(b"x".to_vec())],
+            num_consts: Vec::new(),
+            insts: {
+                let mut v = vec![Instruction::synthetic_header(Opcode::Funcv, 1)];
+                v.extend([
+                    ad(Opcode::Gget, 0, 0),
+                    ad(Opcode::Isf, 0, 0),
+                    ad(Opcode::Jmp, 1, 0x8003),
+                    ad(Opcode::Kshort, 0, 1),
+                    ad(Opcode::Ret1, 0, 2),
+                    ad(Opcode::Jmp, 0, 0x8002),
+                    ad(Opcode::Kshort, 0, 2),
+                    ad(Opcode::Ret1, 0, 2),
+                    ad(Opcode::Ret0, 0, 1),
+                ]);
+                v
+            },
+            debug: None,
+        });
+        // entry = Block 0, then-body = Block 1, dead-jump = Block 2,
+        // else-body = Block 3, merge = Block 4.
+        let (else_start, merge) = branch_shape(&cfg, BlockId(1), BlockId(3)).unwrap();
+        assert_eq!(else_start, Some(BlockId(3)), "dead Jump → if/else");
+        assert_eq!(merge, BlockId(4), "merge = dead Jump target");
+
+        // Case 3: if/then return (no dead Jump). Build the CFG.
+        //   GGET 0 0; ISF 0; JMP => 0006;  (entry)
+        //   KSHORT 0 1; RET1;              (then-body, Return)
+        //   RET0 0 1.                      (merge = true_edge)
+        let cfg = Cfg::build(&Proto {
+            flags: 0,
+            numparams: 0,
+            framesize: 1,
+            upvalues: Vec::new(),
+            gc_consts: vec![GcConst::Str(b"x".to_vec())],
+            num_consts: Vec::new(),
+            insts: {
+                let mut v = vec![Instruction::synthetic_header(Opcode::Funcv, 1)];
+                v.extend([
+                    ad(Opcode::Gget, 0, 0),
+                    ad(Opcode::Isf, 0, 0),
+                    ad(Opcode::Jmp, 1, 0x8002),
+                    ad(Opcode::Kshort, 0, 1),
+                    ad(Opcode::Ret1, 0, 2),
+                    ad(Opcode::Ret0, 0, 1),
+                ]);
+                v
+            },
+            debug: None,
+        });
+        // entry = Block 0, then-body = Block 1, merge = Block 2.
+        let (else_start, merge) = branch_shape(&cfg, BlockId(1), BlockId(2)).unwrap();
+        assert_eq!(else_start, None, "no dead Jump → if/then");
+        assert_eq!(merge, BlockId(2), "merge = entry true_edge");
+
+        // Case 4: if/then fallthrough. Build the CFG.
+        //   GGET 0 0; ISF 0; JMP => 0005;  (entry)
+        //   KSHORT 0 1;                    (then-body, Fallthrough)
+        //   RET1 0 2.                      (merge)
+        let cfg = Cfg::build(&Proto {
+            flags: 0,
+            numparams: 0,
+            framesize: 1,
+            upvalues: Vec::new(),
+            gc_consts: vec![GcConst::Str(b"x".to_vec())],
+            num_consts: Vec::new(),
+            insts: {
+                let mut v = vec![Instruction::synthetic_header(Opcode::Funcv, 1)];
+                v.extend([
+                    ad(Opcode::Gget, 0, 0),
+                    ad(Opcode::Isf, 0, 0),
+                    ad(Opcode::Jmp, 1, 0x8001),
+                    ad(Opcode::Kshort, 0, 1),
+                    ad(Opcode::Ret1, 0, 2),
+                ]);
+                v
+            },
+            debug: None,
+        });
+        // entry = Block 0, then-body = Block 1, merge = Block 2.
+        // Then-body's terminator is Fallthrough(Block 2).
+        let (else_start, merge) = branch_shape(&cfg, BlockId(1), BlockId(2)).unwrap();
+        assert_eq!(else_start, None, "Fallthrough → if/then");
+        assert_eq!(merge, BlockId(2), "merge = Fallthrough target");
+    }
+
     /// Nested if (a ConditionalBranch inside a then-body) isn't
-    /// Stage 7. The recovery bails when it encounters the inner
-    /// ConditionalBranch.
+    /// supported. The recovery bails in [`recover`] via the
+    /// ConditionalBranch-count check before the walk even starts.
     #[test]
     fn recover_nested_if_is_not_supported() {
         // Outer if/then with an inner if/then as the body:
@@ -1670,8 +2024,8 @@ mod tests {
         //   KSHORT 0 1; RET1               (inner then-body)
         //   RET0                            (inner merge = outer body end)
         //   RET0                            (outer merge)
-        // The outer then-body's terminator is a ConditionalBranch;
-        // recover_from sees it and bails.
+        // The CFG has two ConditionalBranch terminators (outer + inner),
+        // so recover() rejects it up front via the count check.
         let insts = vec![
             ad(Opcode::Gget, 0, 0),     // idx 1 — outer cond slot 0
             ad(Opcode::Isf, 0, 0),      // idx 2
@@ -1685,8 +2039,8 @@ mod tests {
         ];
         // The above layout is a bit contrived (the inner merge and
         // then-body-end coincide). What matters for this test is
-        // that recover_from encounters a ConditionalBranch while
-        // walking the outer then-body — that triggers NotImplemented.
+        // that the CFG has two ConditionalBranch blocks — that
+        // triggers the count check's NotImplemented.
         let module = module_with(
             insts,
             Vec::new(),
