@@ -12,8 +12,10 @@
 //!
 //! Linear code (Stages 1-6 shapes) round-trips identically to the
 //! old walk-based emitter; the new capabilities are `if/then` (Stage
-//! 7) and `if/else` (Stage 8). Any CFG shape the recovery doesn't
-//! model surfaces as [`DecompilerError::NotImplemented`].
+//! 7), `if/else` (Stage 8), compound `and`/`or` conditions (Stage 9),
+//! numeric-`for` loops (Stage 10), and `while`/`repeat` loops
+//! (Stage 11). Any CFG shape the recovery doesn't model surfaces as
+//! [`DecompilerError::NotImplemented`].
 //!
 //! ## Formatting invariants
 //!
@@ -143,6 +145,35 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> Option<String> {
             out.push('\n');
             out.push_str(&pad);
             out.push_str("end");
+            Some(out)
+        }
+        Stmt::While { cond, body } => {
+            let mut out = format!("{}while {} do", pad, format_expr(cond));
+            for inner in body {
+                if let Some(line) = format_stmt(inner, indent + 1) {
+                    out.push('\n');
+                    out.push_str(&line);
+                }
+            }
+            out.push('\n');
+            out.push_str(&pad);
+            out.push_str("end");
+            Some(out)
+        }
+        Stmt::Repeat { cond, body } => {
+            // `repeat\n    <body>\nuntil <cond>` — `repeat` has no
+            // header expression; the condition trails the body.
+            let mut out = format!("{}repeat", pad);
+            for inner in body {
+                if let Some(line) = format_stmt(inner, indent + 1) {
+                    out.push('\n');
+                    out.push_str(&line);
+                }
+            }
+            out.push('\n');
+            out.push_str(&pad);
+            out.push_str("until ");
+            out.push_str(&format_expr(cond));
             Some(out)
         }
     }
@@ -498,6 +529,104 @@ mod tests {
         assert_eq!(
             format_stmt(&stmt, 1).unwrap(),
             "    for i = 1, 3 do\n        return i\n    end"
+        );
+    }
+
+    // ---- Stage 11: while/repeat formatting ----------------------------
+
+    #[test]
+    fn formats_while_with_indented_body() {
+        let stmt = Stmt::While {
+            cond: Expr::BinOp {
+                op: BinOpKind::LessThan,
+                left: Box::new(Expr::Var("i".to_string())),
+                right: Box::new(Expr::Int(10)),
+            },
+            body: vec![Stmt::Assign {
+                name: "i".to_string(),
+                expr: Expr::BinOp {
+                    op: BinOpKind::Add,
+                    left: Box::new(Expr::Var("i".to_string())),
+                    right: Box::new(Expr::Int(1)),
+                },
+            }],
+        };
+        assert_eq!(
+            format_stmt(&stmt, 0).unwrap(),
+            "while i < 10 do\n    i = i + 1\nend"
+        );
+    }
+
+    #[test]
+    fn formats_while_empty_body() {
+        // `while cond do end` — empty body produces just the
+        // header + `end`.
+        let stmt = Stmt::While {
+            cond: Expr::Global("x".to_string()),
+            body: vec![],
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "while x do\nend");
+    }
+
+    #[test]
+    fn formats_while_at_nonzero_indent() {
+        // Stage 11 doesn't recover nested loops, but the formatter
+        // must still handle the AST shape if it ever appears.
+        let stmt = Stmt::While {
+            cond: Expr::Global("x".to_string()),
+            body: vec![Stmt::Return(Some(Expr::Int(1)))],
+        };
+        assert_eq!(
+            format_stmt(&stmt, 1).unwrap(),
+            "    while x do\n        return 1\n    end"
+        );
+    }
+
+    #[test]
+    fn formats_repeat_with_indented_body() {
+        let stmt = Stmt::Repeat {
+            // Canonicalized form of `i >= 3` — matches what the
+            // recovery actually produces.
+            cond: Expr::BinOp {
+                op: BinOpKind::LessEqual,
+                left: Box::new(Expr::Int(3)),
+                right: Box::new(Expr::Var("i".to_string())),
+            },
+            body: vec![Stmt::Assign {
+                name: "i".to_string(),
+                expr: Expr::BinOp {
+                    op: BinOpKind::Add,
+                    left: Box::new(Expr::Var("i".to_string())),
+                    right: Box::new(Expr::Int(1)),
+                },
+            }],
+        };
+        assert_eq!(
+            format_stmt(&stmt, 0).unwrap(),
+            "repeat\n    i = i + 1\nuntil 3 <= i"
+        );
+    }
+
+    #[test]
+    fn formats_repeat_empty_body() {
+        // `repeat until cond` — empty body produces just `repeat`
+        // + `until cond`.
+        let stmt = Stmt::Repeat {
+            cond: Expr::Global("x".to_string()),
+            body: vec![],
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "repeat\nuntil x");
+    }
+
+    #[test]
+    fn formats_repeat_at_nonzero_indent() {
+        let stmt = Stmt::Repeat {
+            cond: Expr::Global("x".to_string()),
+            body: vec![Stmt::Return(Some(Expr::Int(1)))],
+        };
+        assert_eq!(
+            format_stmt(&stmt, 1).unwrap(),
+            "    repeat\n        return 1\n    until x"
         );
     }
 

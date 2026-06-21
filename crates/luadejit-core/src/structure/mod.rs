@@ -29,6 +29,23 @@
 //! chains, sequential `if`s) bails with
 //! [`DecompilerError::NotImplemented`] — later stages pick those up.
 //!
+//! **Stage 11** adds `while cond do … end` and `repeat … until cond`
+//! support. Both are detected at the [`ConditionalBranch`] arm of
+//! [`recover_from`]:
+//!
+//! - **Repeat** — the CB's `true_edge` or `false_edge` points back to
+//!   the CB's own block (self-loop). The ISxx tests the CONTINUE
+//!   condition; the user's `until`-condition is its complement.
+//! - **While** — the CB's `false_edge` (the body) ends in a
+//!   [`Jump`](Terminator::Jump) whose target is the CB's own block
+//!   (the loop header). The ISxx tests the EXIT condition; the user's
+//!   `while`-condition is its complement.
+//!
+//! Both shapes share the existing `build_condition` helper (Stage 9)
+//! and inherit its documented canonicalization limitation for ordered
+//! comparisons (e.g. `i >= 3` canonicalizes to `3 <= i` in the
+//! emitted source).
+//!
 //! ## Slot → Expr tracking
 //!
 //! The walk-based Stages 1-6 stored `HashMap<u8, String>` (slot →
@@ -89,6 +106,18 @@ pub enum Stmt {
         step: Option<Expr>,
         body: Vec<Stmt>,
     },
+    /// `while cond do body end` (Stage 11). The condition is the
+    /// complement of the ISxx test (so `while i < 10` is recovered
+    /// from an ISGE testing `i >= 10`).
+    While { cond: Expr, body: Vec<Stmt> },
+    /// `repeat body until cond` (Stage 11). The condition is the
+    /// complement of the ISxx test = the exit condition the user
+    /// wrote. Note LuaJIT canonicalizes ordered comparisons to
+    /// `<`/`<=` by swapping operands, so `until i >= 3` (which
+    /// canonicalizes to `3 <= i`) round-trips as `until 3 <= i`
+    /// — semantically correct but non-canonical (same limitation as
+    /// Stage 9's ordered-comparison conditions).
+    Repeat { cond: Expr, body: Vec<Stmt> },
 }
 
 /// A Lua expression. Stage 7's variants cover the values Stages 1-6
@@ -181,11 +210,16 @@ pub enum BinOpKind {
 ///
 /// Walks the CFG starting at the entry block, threading a
 /// `slot_exprs` map and producing [`Stmt`] nodes. Returns
-/// [`DecompilerError::NotImplemented`] for any CFG shape Stage 8
-/// doesn't model: more than one `ConditionalBranch` (nested `if`,
-/// `elseif` chains, sequential `if`s), compound conditions, loops,
-/// function calls, tail calls, and any block whose terminator isn't
-/// `Return`, `Fallthrough`, or a single `ConditionalBranch`.
+/// [`DecompilerError::NotImplemented`] for any CFG shape the
+/// recovery doesn't model: nested `if`, `elseif` chains, sequential
+/// `if`s, compound `while`/`repeat` conditions, nested loops,
+/// endless loops, `break`/`continue`, function calls, tail calls,
+/// and any block whose terminator isn't recognized.
+///
+/// **Stages 7-10** handle linear code, single `if/then` and
+/// `if/else`, compound `and`/`or` conditions, and numeric-`for`
+/// loops. **Stage 11** adds `while`/`repeat` loops with simple
+/// single-condition headers.
 ///
 /// Unreachable blocks (e.g. the dead "skip-else" JMP LuaJIT emits
 /// after a returning then-body) are *not* rejected wholesale — they
@@ -424,7 +458,7 @@ fn recover_from(
                 return Err(DecompilerError::NotImplemented);
             }
             Terminator::ConditionalBranch {
-                condition: _first_condition,
+                condition: first_condition,
                 true_edge: first_true_edge,
                 false_edge: first_false_edge,
             } => {
@@ -435,6 +469,121 @@ fn recover_from(
                 if stop_at_merge {
                     return Err(DecompilerError::NotImplemented);
                 }
+                // ---- Stage 11: while/repeat loop detection ----
+                //
+                // Before the if/then/else chain logic, check whether
+                // this CB is a loop header:
+                //   1. Self-loop (repeat): one of the CB's edges points
+                //      back to the current block.
+                //   2. Body jumps back (while): the false_edge block
+                //      (the body) ends in a Jump whose target is the
+                //      current block.
+                //
+                // Order matters: the self-loop check has to come first
+                // because a degenerate `while true do … end` would
+                // have both edges pointing at the header (handled as
+                // repeat-shape here, then bailed on below since the
+                // ISxx doesn't fit). Compound conditions (chain.len()
+                // > 1) fall through to the chain logic below and bail
+                // via the body's LOOP marker — out of scope for Stage
+                // 11.
+
+                // Repeat: self-loop. The CB's true_edge or false_edge
+                // is the current block.
+                if first_true_edge == block_id || first_false_edge == block_id {
+                    let exit = if first_true_edge == block_id {
+                        first_false_edge
+                    } else {
+                        first_true_edge
+                    };
+                    let cond_idx = first_condition.0 as usize;
+                    // The block layout for `repeat … until cond` is
+                    //   [LOOP?, body_code, condition_setup, ISxx, JMP]
+                    // The body is everything before the ISxx. LOOP is
+                    // a no-op marker (handled in `process_inst`);
+                    // condition_setup (e.g. KSHORT loading the
+                    // comparison constant) populates `slot_exprs`
+                    // without emitting a Stmt when the target slot is
+                    // unnamed.
+                    let mut body_stmts: Vec<Stmt> = Vec::new();
+                    for inst_id in &block.insts {
+                        if (inst_id.0 as usize) >= cond_idx {
+                            break;
+                        }
+                        process_inst(ctx, &mut body_stmts, *inst_id)?;
+                    }
+                    let cond_inst = &ctx.proto.insts[cond_idx];
+                    // build_condition gives the complement of the
+                    // ISxx test = the user's until-condition (the
+                    // exit condition).
+                    let cond = build_condition(ctx.proto, ctx.slot_exprs, cond_inst)?;
+                    stmts.push(Stmt::Repeat {
+                        cond,
+                        body: body_stmts,
+                    });
+                    current = Some(exit);
+                    continue;
+                }
+
+                // While: false_edge (body) jumps back to this block.
+                // Bound to a local scope so the `body_block` borrow
+                // ends before the chain logic below.
+                let is_while_loop = {
+                    let body_block = &ctx.cfg.blocks[first_false_edge.0 as usize];
+                    matches!(
+                        body_block.terminator,
+                        Terminator::Jump(target) if target == block_id
+                    )
+                };
+                if is_while_loop {
+                    let cond_idx = first_condition.0 as usize;
+                    // Process the header's prefix instructions
+                    // (everything before the ISxx) into the outer
+                    // stmts list. For `while i < 10` the prefix is
+                    // `KSHORT 1 10` — loading the comparison constant
+                    // into slot 1, an unnamed temp, so no Stmt is
+                    // emitted but `slot_exprs[1] = Int(10)`.
+                    for inst_id in &block.insts {
+                        if (inst_id.0 as usize) >= cond_idx {
+                            break;
+                        }
+                        process_inst(ctx, stmts, *inst_id)?;
+                    }
+                    let cond_inst = &ctx.proto.insts[cond_idx];
+                    // build_condition gives the complement of the
+                    // ISxx test = the user's while-condition (the
+                    // entry condition).
+                    let cond = build_condition(ctx.proto, ctx.slot_exprs, cond_inst)?;
+                    // Process the body block. Its terminator is a
+                    // Jump(header) back-edge; the prefix is the body
+                    // source. LOOP marker at the start is a no-op.
+                    let body_block = &ctx.cfg.blocks[first_false_edge.0 as usize];
+                    let mut body_stmts: Vec<Stmt> = Vec::new();
+                    let body_last_idx = body_block.insts.last().map(|id| id.0 as usize).unwrap();
+                    for inst_id in &body_block.insts {
+                        if (inst_id.0 as usize) == body_last_idx {
+                            break;
+                        }
+                        process_inst(ctx, &mut body_stmts, *inst_id)?;
+                    }
+                    // Mark the body block as visited. Simple loops
+                    // never re-enter the body via the back-edge (the
+                    // recovery stops at the back-edge rather than
+                    // following it), so this is defensive — it
+                    // catches a future loop pattern that would
+                    // otherwise infinite-recurse.
+                    ctx.visited.insert(first_false_edge);
+                    stmts.push(Stmt::While {
+                        cond,
+                        body: body_stmts,
+                    });
+                    // Continue at the exit (the true_edge — where the
+                    // ISxx+JMP lands when the loop condition fails).
+                    current = Some(first_true_edge);
+                    continue;
+                }
+
+                // ---- Existing if/then/else chain handling ----
                 // Collect the chain of CB blocks reachable via
                 // false_edge. For Stages 7-8 fixtures this is just
                 // [entry]; for Stage 9 AND/OR chains it contains one
@@ -882,6 +1031,12 @@ fn process_inst(
                 source_expr,
                 real_idx,
             );
+        }
+        Opcode::Loop => {
+            // LOOP marker — informational only. A holds a framesize
+            // hint, D holds the loop exit target; both are irrelevant
+            // to source recovery. Treated as a no-op so while/repeat
+            // bodies (which start with a LOOP marker) walk cleanly.
         }
         _ => return Err(DecompilerError::NotImplemented),
     }
@@ -3463,5 +3618,369 @@ mod tests {
             "expected NotImplemented for nested loop in if-body, got {:?}",
             result
         );
+    }
+
+    // ====================================================================
+    // Stage 11: while/repeat recovery unit tests
+    // ====================================================================
+    //
+    // The integration tests in `tests/stage11_while_repeat.rs` cover
+    // the end-to-end pipeline. The unit tests below isolate the
+    // while/repeat detection logic at the AST level so failures point
+    // at the right layer.
+
+    /// Build a Stage-11 module mirroring `local i = 0; while i < N do
+    /// i = i + 1 end[; return i]`. Caller supplies `N` and whether to
+    /// emit a trailing `return i`.
+    ///
+    /// Bytecode shape (abs idx → real idx):
+    ///   1 KSHORT 0 0     real-idx 0  (i = 0)
+    ///   2 KSHORT 1 N     real-idx 1  (loop header: load N)
+    ///   3 ISGE 0 1       real-idx 2  (test: i >= N?)
+    ///   4 JMP => exit    real-idx 3  (if i >= N, exit loop)
+    ///   5 LOOP => exit   real-idx 4  (body start marker)
+    ///   6 ADDVN 0 0 0    real-idx 5  (i = i + 1)
+    ///   7 JMP => 0002    real-idx 6  (back-edge)
+    ///   8 RET1 0 2       real-idx 7  (exit: return i)
+    ///                 OR RET0 0 1     (exit: implicit return)
+    fn while_loop_module(n: u16, with_return: bool) -> Module {
+        // JMP at idx 4 targets exit at idx 8 → j = 8 - 5 = 3, D = 0x8003.
+        // JMP at idx 7 targets header at idx 2 → j = 2 - 8 = -6, D = 0x7FFA.
+        let exit_inst = if with_return {
+            ad(Opcode::Ret1, 0, 2)
+        } else {
+            ad(Opcode::Ret0, 0, 1)
+        };
+        let insts = vec![
+            ad(Opcode::Kshort, 0, 0),
+            ad(Opcode::Kshort, 1, n),
+            ad(Opcode::Isge, 0, 1),
+            ad(Opcode::Jmp, 1, 0x8003),
+            ad(Opcode::Loop, 1, 0x8003),
+            abc(Opcode::Addvn, 0, 0, 0),
+            ad(Opcode::Jmp, 1, 0x7FFA),
+            exit_inst,
+        ];
+        module_with(
+            insts,
+            vec![named_local(0, "i", 0, 7)],
+            Vec::new(),
+            vec![NumConst::Int(1)],
+            2,
+        )
+    }
+
+    /// `local i = 0; while i < 10 do i = i + 1 end; return i` →
+    /// emits canonical source through the full pipeline.
+    #[test]
+    fn recover_while_basic() {
+        let module = while_loop_module(10, true);
+        assert_eq!(
+            emit(&module),
+            "local i = 0\nwhile i < 10 do\n    i = i + 1\nend\nreturn i"
+        );
+    }
+
+    /// `local i = 0; while i < 3 do i = i + 1 end` (no return) →
+    /// the implicit RET0 produces no Stmt; the AST is just the local
+    /// declaration followed by the While.
+    #[test]
+    fn recover_while_no_return() {
+        let module = while_loop_module(3, false);
+        assert_eq!(
+            emit(&module),
+            "local i = 0\nwhile i < 3 do\n    i = i + 1\nend"
+        );
+    }
+
+    /// Same `while_basic` fixture recovered directly to AST. Verifies
+    /// the `Stmt::While` tree shape: condition is the complement of
+    /// ISGE (= LessThan), body is a single Assign.
+    #[test]
+    fn recover_while_ast_shape() {
+        let module = while_loop_module(10, true);
+        let proto = module.main_proto();
+        let cfg = Cfg::build(proto);
+        let ast = recover(proto, &cfg).expect("recover should succeed");
+
+        assert_eq!(ast.len(), 3, "expected [LocalDecl, While, Return]");
+        match &ast[0] {
+            Stmt::LocalDecl { name, expr } => {
+                assert_eq!(name, "i");
+                assert_eq!(*expr, Expr::Int(0), "local i = 0");
+            }
+            other => panic!("expected LocalDecl, got {:?}", other),
+        }
+        match &ast[1] {
+            Stmt::While { cond, body } => {
+                // ISGE 0 1 tests R[0] >= R[1] = `i >= 10`; complement
+                // is `i < 10`.
+                assert_eq!(
+                    cond.clone(),
+                    Expr::BinOp {
+                        op: BinOpKind::LessThan,
+                        left: Box::new(Expr::Var("i".to_string())),
+                        right: Box::new(Expr::Int(10)),
+                    },
+                    "while condition"
+                );
+                assert_eq!(body.len(), 1, "body len");
+                match &body[0] {
+                    Stmt::Assign { name, expr } => {
+                        assert_eq!(name, "i");
+                        // i + 1: ADDVN 0 0 0; num_const[0] = Int(1).
+                        assert_eq!(
+                            expr.clone(),
+                            Expr::BinOp {
+                                op: BinOpKind::Add,
+                                left: Box::new(Expr::Var("i".to_string())),
+                                right: Box::new(Expr::Int(1)),
+                            },
+                            "body: i = i + 1"
+                        );
+                    }
+                    other => panic!("expected Assign, got {:?}", other),
+                }
+            }
+            other => panic!("expected While, got {:?}", other),
+        }
+        match &ast[2] {
+            Stmt::Return(Some(expr)) => assert_eq!(*expr, Expr::Var("i".to_string())),
+            other => panic!("expected Return(Some(Var(i))), got {:?}", other),
+        }
+    }
+
+    /// Build a Stage-11 module mirroring `local i = 0; repeat
+    /// i = i + 1 until i >= N; return i`. Caller supplies `N`.
+    ///
+    /// Bytecode shape (mirrors `luajit -bl` exactly):
+    ///   1 KSHORT 0 0     real-idx 0  (i = 0)
+    ///   2 LOOP => exit   real-idx 1  (body start marker)
+    ///   3 ADDVN 0 0 0    real-idx 2  (i = i + 1)
+    ///   4 KSHORT 1 N     real-idx 3  (load N for the comparison)
+    ///   5 ISGT 1 0       real-idx 4  (test: N > i? continue)
+    ///   6 JMP => 0002    real-idx 5  (back-edge to LOOP)
+    ///   7 RET1 0 2       real-idx 6  (exit: return i)
+    fn repeat_loop_module(n: u16) -> Module {
+        // LOOP at idx 2 targets exit at idx 7 → D encoded as 0x8000 + (7 - 3) = 0x8004.
+        // JMP at idx 6 targets header at idx 2 → j = 2 - 7 = -5, D = 0x7FFB.
+        let insts = vec![
+            ad(Opcode::Kshort, 0, 0),
+            ad(Opcode::Loop, 1, 0x8004),
+            abc(Opcode::Addvn, 0, 0, 0),
+            ad(Opcode::Kshort, 1, n),
+            ad(Opcode::Isgt, 1, 0),
+            ad(Opcode::Jmp, 1, 0x7FFB),
+            ad(Opcode::Ret1, 0, 2),
+        ];
+        module_with(
+            insts,
+            vec![named_local(0, "i", 0, 6)],
+            Vec::new(),
+            vec![NumConst::Int(1)],
+            2,
+        )
+    }
+
+    /// `local i = 0; repeat i = i + 1 until i >= 3; return i` →
+    /// emits source through the full pipeline. Note LuaJIT
+    /// canonicalizes `i >= 3` to `3 <= i` (the documented Stage 9
+    /// limitation for ordered comparisons).
+    #[test]
+    fn recover_repeat_basic() {
+        let module = repeat_loop_module(3);
+        assert_eq!(
+            emit(&module),
+            "local i = 0\nrepeat\n    i = i + 1\nuntil 3 <= i\nreturn i"
+        );
+    }
+
+    /// Same `repeat_basic` fixture recovered directly to AST.
+    /// Verifies the `Stmt::Repeat` tree shape: condition is the
+    /// complement of ISGT (= LessEqual, with operands in canonical
+    /// order — constant on the left).
+    #[test]
+    fn recover_repeat_ast_shape() {
+        let module = repeat_loop_module(3);
+        let proto = module.main_proto();
+        let cfg = Cfg::build(proto);
+        let ast = recover(proto, &cfg).expect("recover should succeed");
+
+        assert_eq!(ast.len(), 3, "expected [LocalDecl, Repeat, Return]");
+        match &ast[0] {
+            Stmt::LocalDecl { name, expr } => {
+                assert_eq!(name, "i");
+                assert_eq!(*expr, Expr::Int(0), "local i = 0");
+            }
+            other => panic!("expected LocalDecl, got {:?}", other),
+        }
+        match &ast[1] {
+            Stmt::Repeat { cond, body } => {
+                // ISGT 1 0 tests R[1] > R[0] = `3 > i` (continue
+                // condition); complement is `3 <= i`.
+                assert_eq!(
+                    cond.clone(),
+                    Expr::BinOp {
+                        op: BinOpKind::LessEqual,
+                        left: Box::new(Expr::Int(3)),
+                        right: Box::new(Expr::Var("i".to_string())),
+                    },
+                    "until condition (canonicalized)"
+                );
+                assert_eq!(body.len(), 1, "body len");
+                match &body[0] {
+                    Stmt::Assign { name, expr } => {
+                        assert_eq!(name, "i");
+                        assert_eq!(
+                            expr.clone(),
+                            Expr::BinOp {
+                                op: BinOpKind::Add,
+                                left: Box::new(Expr::Var("i".to_string())),
+                                right: Box::new(Expr::Int(1)),
+                            },
+                            "body: i = i + 1"
+                        );
+                    }
+                    other => panic!("expected Assign, got {:?}", other),
+                }
+            }
+            other => panic!("expected Repeat, got {:?}", other),
+        }
+        match &ast[2] {
+            Stmt::Return(Some(expr)) => assert_eq!(*expr, Expr::Var("i".to_string())),
+            other => panic!("expected Return(Some(Var(i))), got {:?}", other),
+        }
+    }
+
+    /// `while` detection requires the body block's terminator to be a
+    /// `Jump(header)`. If the body's terminator is something else
+    /// (e.g. Fallthrough into a merge), the recovery treats the CB as
+    /// a regular if/then. This test confirms a regular if/then still
+    /// works when the false_edge block doesn't loop back: the same
+    /// Stage 7 shape (`if x then return 1 end`) is recovered as If,
+    /// not While.
+    #[test]
+    fn recover_if_then_when_body_does_not_loop_back() {
+        //   GGET 0 0; ISF 0; JMP => 0006;  (entry CB)
+        //   KSHORT 0 1; RET1;              (then-body, returns)
+        //   RET0.                           (merge = true_edge)
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Isf, 0, 0),
+            ad(Opcode::Jmp, 1, 0x8002),
+            ad(Opcode::Kshort, 0, 1),
+            ad(Opcode::Ret1, 0, 2),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"x".to_vec())],
+            Vec::new(),
+            1,
+        );
+        let proto = module.main_proto();
+        let cfg = Cfg::build(proto);
+        let ast = recover(proto, &cfg).expect("recover should succeed");
+        assert_eq!(ast.len(), 1, "expected just [If]");
+        assert!(
+            matches!(ast[0], Stmt::If { .. }),
+            "expected If, not While, when body doesn't loop back"
+        );
+    }
+
+    /// A 2-CB AND chain (`if a and b then … end` shape) is NOT
+    /// treated as a while loop even though the chain has a body
+    /// block — the chain logic at the ConditionalBranch arm runs
+    /// only when neither the self-loop nor the back-edge checks
+    /// match. This test confirms the chain path still produces an
+    /// `If`, not a `While`, for the Stage 9 AND-chain shape.
+    #[test]
+    fn recover_and_chain_is_not_while() {
+        //   GGET 0 0; ISF 0; JMP => 0009;  (CB1)
+        //   GGET 0 1; ISF 0; JMP => 0009;  (CB2)
+        //   KSHORT 0 1; RET1; RET0.        (then-body + merge)
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Isf, 0, 0),
+            ad(Opcode::Jmp, 1, 0x8005),
+            ad(Opcode::Gget, 0, 1),
+            ad(Opcode::Isf, 0, 0),
+            ad(Opcode::Jmp, 1, 0x8002),
+            ad(Opcode::Kshort, 0, 1),
+            ad(Opcode::Ret1, 0, 2),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"b".to_vec()), GcConst::Str(b"a".to_vec())],
+            Vec::new(),
+            1,
+        );
+        let proto = module.main_proto();
+        let cfg = Cfg::build(proto);
+        let ast = recover(proto, &cfg).expect("recover should succeed");
+        assert_eq!(ast.len(), 1, "expected just [If]");
+        assert!(
+            matches!(ast[0], Stmt::If { .. }),
+            "AND chain should be If, not While"
+        );
+    }
+
+    /// An empty `while` body (`while x do end`) — the body block is
+    /// just [LOOP, JMP]. The recovery should produce an empty body
+    /// Vec and emit `while <cond> do\nend`.
+    #[test]
+    fn recover_while_empty_body() {
+        //   KSHORT 0 1; KSHORT 1 2; ISGE 0 1; JMP => 0007;
+        //   LOOP 1 => 0007; JMP => 0002;   (empty body)
+        //   RET0.
+        let insts = vec![
+            ad(Opcode::Kshort, 0, 1),
+            ad(Opcode::Kshort, 1, 2),
+            ad(Opcode::Isge, 0, 1),
+            ad(Opcode::Jmp, 1, 0x8002), // idx 4: target = idx 7
+            ad(Opcode::Loop, 1, 0x8002),
+            ad(Opcode::Jmp, 1, 0x7ffb), // idx 6: target = idx 2 (back-edge)
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "a", 0, 6), named_local(1, "b", 1, 6)],
+            Vec::new(),
+            Vec::new(),
+            2,
+        );
+        assert_eq!(
+            emit(&module),
+            "local a = 1\nlocal b = 2\nwhile a < b do\nend"
+        );
+    }
+
+    /// An empty `repeat` body (`repeat until x`) — body is just
+    /// [LOOP, condition, JMP]. The recovery should produce an empty
+    /// body Vec.
+    #[test]
+    fn recover_repeat_empty_body() {
+        //   KSHORT 0 0; LOOP 1 => 0006; KSHORT 1 3; ISGT 1 0; JMP => 0002; RET0.
+        // Loop runs zero times if i happens to already be >= 3, but
+        // for testing purposes the bytecode shape is what matters.
+        let insts = vec![
+            ad(Opcode::Kshort, 0, 0),
+            ad(Opcode::Loop, 1, 0x8004), // idx 2: target = idx 6
+            ad(Opcode::Kshort, 1, 3),
+            ad(Opcode::Isgt, 1, 0),
+            ad(Opcode::Jmp, 1, 0x7ffc), // idx 5: target = idx 2
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "i", 0, 5)],
+            Vec::new(),
+            Vec::new(),
+            2,
+        );
+        assert_eq!(emit(&module), "local i = 0\nrepeat\nuntil 3 <= i");
     }
 }
