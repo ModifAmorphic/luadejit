@@ -13,9 +13,9 @@
 //! Linear code (Stages 1-6 shapes) round-trips identically to the
 //! old walk-based emitter; the new capabilities are `if/then` (Stage
 //! 7), `if/else` (Stage 8), compound `and`/`or` conditions (Stage 9),
-//! numeric-`for` loops (Stage 10), and `while`/`repeat` loops
-//! (Stage 11). Any CFG shape the recovery doesn't model surfaces as
-//! [`DecompilerError::NotImplemented`].
+//! numeric-`for` loops (Stage 10), `while`/`repeat` loops (Stage 11),
+//! and regular function calls (Stage 12). Any CFG shape the recovery
+//! doesn't model surfaces as [`DecompilerError::NotImplemented`].
 //!
 //! ## Formatting invariants
 //!
@@ -79,6 +79,7 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> Option<String> {
         Stmt::Assign { name, expr } => Some(format!("{}{} = {}", pad, name, format_expr(expr))),
         Stmt::Return(Some(expr)) => Some(format!("{}return {}", pad, format_expr(expr))),
         Stmt::Return(None) => None,
+        Stmt::Call { func, args } => Some(format!("{}{}", pad, format_call(func, args))),
         Stmt::If {
             cond,
             then_body,
@@ -226,7 +227,24 @@ fn format_expr(expr: &Expr) -> String {
         Expr::Or(left, right) => {
             format!("{} or {}", format_expr(left), format_expr(right))
         }
+        Expr::Call { func, args } => format_call(func, args),
     }
+}
+
+/// Format a function call's `func(args...)` portion (without leading
+/// indentation). Shared between [`Stmt::Call`] (a bare call
+/// statement) and [`Expr::Call`] (a call nested inside another
+/// expression).
+///
+/// `func` is formatted via [`format_expr`]; Stage 12 only emits
+/// calls whose function is a bare global name, so no
+/// parenthesization is needed. Future stages that allow calls on
+/// non-atomic expressions (e.g. `(a or b).method()` — Stage 13's
+/// method-call desugaring will cover this) will need to add
+/// precedence-aware parenthesization here.
+fn format_call(func: &Expr, args: &[Expr]) -> String {
+    let args_str = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+    format!("{}({})", format_expr(func), args_str)
 }
 
 /// Map a [`BinOpKind`] to its Lua source operator.
@@ -363,6 +381,113 @@ mod tests {
             Box::new(Expr::Global("b".to_string())),
         );
         assert_eq!(format_expr(&expr), "a or b");
+    }
+
+    // ---- Stage 12: function-call formatting ----------------------------
+
+    #[test]
+    fn formats_call_no_args() {
+        // `f()` — bare global, empty arg list.
+        let expr = Expr::Call {
+            func: Box::new(Expr::Global("f".to_string())),
+            args: vec![],
+        };
+        assert_eq!(format_expr(&expr), "f()");
+    }
+
+    #[test]
+    fn formats_call_one_arg() {
+        // `print("hello")` — single string arg.
+        let expr = Expr::Call {
+            func: Box::new(Expr::Global("print".to_string())),
+            args: vec![Expr::Str(b"hello".to_vec())],
+        };
+        assert_eq!(format_expr(&expr), "print(\"hello\")");
+    }
+
+    #[test]
+    fn formats_call_multiple_args() {
+        // `print("a", "b", "c")` — comma-separated args.
+        let expr = Expr::Call {
+            func: Box::new(Expr::Global("print".to_string())),
+            args: vec![
+                Expr::Str(b"a".to_vec()),
+                Expr::Str(b"b".to_vec()),
+                Expr::Str(b"c".to_vec()),
+            ],
+        };
+        assert_eq!(format_expr(&expr), "print(\"a\", \"b\", \"c\")");
+    }
+
+    #[test]
+    fn formats_call_with_mixed_arg_types() {
+        // `f(1, "x", nil, true)` — int / str / nil / bool args.
+        let expr = Expr::Call {
+            func: Box::new(Expr::Global("f".to_string())),
+            args: vec![
+                Expr::Int(1),
+                Expr::Str(b"x".to_vec()),
+                Expr::Nil,
+                Expr::True,
+            ],
+        };
+        assert_eq!(format_expr(&expr), "f(1, \"x\", nil, true)");
+    }
+
+    #[test]
+    fn formats_call_with_var_arg() {
+        // `f(x)` — Var arg (the local/global reads back through
+        // format_expr's Var arm).
+        let expr = Expr::Call {
+            func: Box::new(Expr::Global("f".to_string())),
+            args: vec![Expr::Var("x".to_string())],
+        };
+        assert_eq!(format_expr(&expr), "f(x)");
+    }
+
+    #[test]
+    fn formats_call_statement_at_zero_indent() {
+        // Bare call statement: `print("hello")` at the top level.
+        let stmt = Stmt::Call {
+            func: Expr::Global("print".to_string()),
+            args: vec![Expr::Str(b"hello".to_vec())],
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "print(\"hello\")");
+    }
+
+    #[test]
+    fn formats_call_statement_at_nonzero_indent() {
+        // Inside a loop body (which Stage 12 doesn't decompile, but
+        // the formatter must still handle the AST shape), a bare call
+        // indents with the surrounding block.
+        let stmt = Stmt::Call {
+            func: Expr::Global("print".to_string()),
+            args: vec![Expr::Int(42)],
+        };
+        assert_eq!(format_stmt(&stmt, 1).unwrap(), "    print(42)");
+    }
+
+    #[test]
+    fn formats_local_decl_with_call_rhs() {
+        // `local x = f(1)` — Call as the RHS of a LocalDecl.
+        let stmt = Stmt::LocalDecl {
+            name: "x".to_string(),
+            expr: Expr::Call {
+                func: Box::new(Expr::Global("f".to_string())),
+                args: vec![Expr::Int(1)],
+            },
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "local x = f(1)");
+    }
+
+    #[test]
+    fn formats_return_with_call_expr() {
+        // `return f(1)` — Call as the returned expression.
+        let stmt = Stmt::Return(Some(Expr::Call {
+            func: Box::new(Expr::Global("f".to_string())),
+            args: vec![Expr::Int(1)],
+        }));
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "return f(1)");
     }
 
     #[test]
