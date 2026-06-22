@@ -25,9 +25,16 @@
 //!   sharing a true_edge → merge is AND; the first CB short-circuiting
 //!   to the then-body is OR.
 //!
-//! Everything else (loops, function calls, nested `if`, `elseif`
+//! Everything else (loops, nested `if`, `elseif`
 //! chains, sequential `if`s) bails with
 //! [`DecompilerError::NotImplemented`] — later stages pick those up.
+//!
+//! **Stage 12** adds regular function calls (`print("hello")`,
+//! `f(1, 2)`, `local x = tostring(42)`). The recovery handles CALL
+//! with zero or one explicit results and a fixed (non-multres)
+//! argument list. Tail calls (CALLT/CALLMT) remain CFG-terminator
+//! bailouts; method calls (Stage 13) and multres (Stage 15) are
+//! deferred.
 //!
 //! **Stage 11** adds `while cond do … end` and `repeat … until cond`
 //! support. Both are detected at the [`ConditionalBranch`] arm of
@@ -118,6 +125,12 @@ pub enum Stmt {
     /// — semantically correct but non-canonical (same limitation as
     /// Stage 9's ordered-comparison conditions).
     Repeat { cond: Expr, body: Vec<Stmt> },
+    /// A bare function call whose result is discarded (Stage 12):
+    /// `print("hello")`. The recovery pushes this when `CALL` has
+    /// B=1 (zero results). When a call has a single result that's
+    /// actually used, the call surfaces as an [`Expr::Call`] inside
+    /// another statement (LocalDecl / Assign / Return) instead.
+    Call { func: Expr, args: Vec<Expr> },
 }
 
 /// A Lua expression. Stage 7's variants cover the values Stages 1-6
@@ -175,6 +188,14 @@ pub enum Expr {
     /// `left or right` — Stage 9's chained OR condition. Same
     /// formatting caveat as [`Expr::And`].
     Or(Box<Expr>, Box<Expr>),
+    /// A function call `func(args...)` (Stage 12). Emitted without
+    /// parenthesization of `func` (Stage 12 fixtures only call bare
+    /// globals; calls on table fields or parenthesized expressions
+    /// are later stages).
+    Call {
+        func: Box<Expr>,
+        args: Vec<Expr>,
+    },
 }
 
 /// The binary operator kind attached to [`Expr::BinOp`]. Stage 7
@@ -213,13 +234,14 @@ pub enum BinOpKind {
 /// [`DecompilerError::NotImplemented`] for any CFG shape the
 /// recovery doesn't model: nested `if`, `elseif` chains, sequential
 /// `if`s, compound `while`/`repeat` conditions, nested loops,
-/// endless loops, `break`/`continue`, function calls, tail calls,
-/// and any block whose terminator isn't recognized.
+/// endless loops, `break`/`continue`, tail calls, and any block
+/// whose terminator isn't recognized.
 ///
 /// **Stages 7-10** handle linear code, single `if/then` and
 /// `if/else`, compound `and`/`or` conditions, and numeric-`for`
 /// loops. **Stage 11** adds `while`/`repeat` loops with simple
-/// single-condition headers.
+/// single-condition headers. **Stage 12** adds regular (non-tail,
+/// non-multres, non-method) function calls.
 ///
 /// Unreachable blocks (e.g. the dead "skip-else" JMP LuaJIT emits
 /// after a returning then-body) are *not* rejected wholesale — they
@@ -1037,6 +1059,68 @@ fn process_inst(
             // hint, D holds the loop exit target; both are irrelevant
             // to source recovery. Treated as a no-op so while/repeat
             // bodies (which start with a LOOP marker) walk cleanly.
+        }
+        Opcode::Call => {
+            // CALL A B C — function call. Per the (empirically
+            // verified) convention:
+            //   - A     = base slot; function is at slot A.
+            //   - B-1   = number of return values expected
+            //             (B == 0 means multres — Stage 15).
+            //   - C-1   = number of arguments (C == 0 means multres
+            //             call from a VARG/previous CALL — Stage 15).
+            // Arguments occupy slots A+2..=A+C (note the gap: slot
+            // A+1 is unused for regular calls). Results overwrite
+            // slots starting at A.
+            //
+            // Stage 12 only models the regular cases: zero or one
+            // explicit results, and a fixed (non-multres) argument
+            // list. Tail calls (CALLT/CALLMT) are CFG terminators
+            // handled in the recovery walk (they bail with
+            // NotImplemented); method calls (Stage 13) and multres
+            // (Stage 15) are deferred.
+            if inst.b() == 0 || inst.c == 0 {
+                return Err(DecompilerError::NotImplemented);
+            }
+            let func = lookup_operand(ctx.slot_exprs, inst.a)?;
+            let arg_count = (inst.c - 1) as usize;
+            let mut args = Vec::with_capacity(arg_count);
+            for slot in (inst.a + 2)..=(inst.a + inst.c) {
+                args.push(lookup_operand(ctx.slot_exprs, slot)?);
+            }
+            let result_count = inst.b() - 1;
+            match result_count {
+                0 => {
+                    // Result discarded — emit a bare call statement.
+                    // No slot update needed: nothing was stored.
+                    stmts.push(Stmt::Call { func, args });
+                }
+                1 => {
+                    // Single result stored at slot A. Route through
+                    // assign_slot_ast so the destination is
+                    // recognized as a `local x = f(...)` declaration,
+                    // an `x = f(...)` reassignment, or an unnamed
+                    // temp (the latter emits no line; the call
+                    // surfaces later via the slot map, e.g. as
+                    // `return f(...)`).
+                    let call_expr = Expr::Call {
+                        func: Box::new(func),
+                        args,
+                    };
+                    assign_slot_ast(
+                        ctx.proto,
+                        ctx.slot_exprs,
+                        stmts,
+                        inst.a,
+                        call_expr,
+                        real_idx,
+                    );
+                }
+                _ => {
+                    // Multiple return values (e.g. `local a, b = f()`)
+                    // — Stage 15.
+                    return Err(DecompilerError::NotImplemented);
+                }
+            }
         }
         _ => return Err(DecompilerError::NotImplemented),
     }
@@ -3982,5 +4066,347 @@ mod tests {
             2,
         );
         assert_eq!(emit(&module), "local i = 0\nrepeat\nuntil 3 <= i");
+    }
+
+    // ====================================================================
+    // Stage 12: function-call recovery unit tests
+    // ====================================================================
+    //
+    // The integration tests in `tests/stage12_calls.rs` cover the
+    // end-to-end pipeline (parse → CFG → recover → emit) using real
+    // `luajit -b -g` fixtures. The unit tests below isolate the CALL
+    // handling in [`process_inst`] so failures point at the right
+    // layer.
+
+    /// Build a Stage-12 module mirroring `print("hello")`'s bytecode
+    /// (verified via `luajit -bl`):
+    ///   1 GGET  0 0     real-idx 0  (function at slot 0)
+    ///   2 KSTR  2 1     real-idx 1  (arg at slot 2; gap at slot 1)
+    ///   3 CALL  0 1 2   real-idx 2  (B=1: 0 results; C=2: 1 arg)
+    ///   4 RET0  0 1     real-idx 3
+    ///
+    /// Caller supplies the argument's load instruction + GC constant
+    /// table so individual tests can vary the argument's type.
+    fn call_no_result_module(arg_load: Instruction, gc_consts: Vec<GcConst>) -> Module {
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            arg_load,
+            abc(Opcode::Call, 0, 1, 2),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        module_with(insts, Vec::new(), gc_consts, Vec::new(), 3)
+    }
+
+    /// `print("hello")` — bare call, single string arg, no result.
+    /// The recovery pushes a `Stmt::Call` directly (no slot update).
+    #[test]
+    fn recover_call_no_result_string_arg() {
+        // GGET 0 0 → Global("print") (operand 0); KSTR 2 1 →
+        // Str("hello") (operand 1). With gc_consts = [hello, print]
+        // (file order), reverse-index gives operand 0 → [1] = print,
+        // operand 1 → [0] = hello.
+        let module = call_no_result_module(
+            ad(Opcode::Kstr, 2, 1),
+            vec![
+                GcConst::Str(b"hello".to_vec()),
+                GcConst::Str(b"print".to_vec()),
+            ],
+        );
+        assert_eq!(emit(&module), "print(\"hello\")");
+    }
+
+    /// Same fixture recovered directly to AST. Verifies the
+    /// `Stmt::Call` tree shape: func is `Global("print")`, args is
+    /// `[Str("hello")]`. The implicit RET0 produces no Stmt.
+    #[test]
+    fn recover_call_no_result_ast_shape() {
+        let module = call_no_result_module(
+            ad(Opcode::Kstr, 2, 1),
+            vec![
+                GcConst::Str(b"hello".to_vec()),
+                GcConst::Str(b"print".to_vec()),
+            ],
+        );
+        let proto = module.main_proto();
+        let cfg = Cfg::build(proto);
+        let ast = recover(proto, &cfg).expect("recover should succeed");
+        assert_eq!(
+            ast.len(),
+            1,
+            "expected just [Call] (implicit RET0 → no Stmt)"
+        );
+        match &ast[0] {
+            Stmt::Call { func, args } => {
+                assert_eq!(*func, Expr::Global("print".to_string()), "func");
+                assert_eq!(args.len(), 1, "args len");
+                assert_eq!(args[0], Expr::Str(b"hello".to_vec()), "arg 0");
+            }
+            other => panic!("expected Call, got {:?}", other),
+        }
+    }
+
+    /// `f()` — bare call with NO arguments (C=1, meaning 0 args).
+    /// Confirms the arg-count math: `arg_count = C - 1 = 0`, and
+    /// the arg-slot loop `(A+2)..=(A+C)` is empty when C == 1.
+    #[test]
+    fn recover_call_no_args() {
+        //   GGET 0 0; CALL 0 1 1; RET0.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            abc(Opcode::Call, 0, 1, 1),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "f()");
+    }
+
+    /// `print("a", "b", "c")` — bare call with three args. Verifies
+    /// the arg-slot range `(A+2)..=(A+C)` covers slots 2, 3, 4 when
+    /// C == 4 (3 args). Bytecode mirrors `luajit -bl` exactly.
+    #[test]
+    fn recover_call_multiple_args() {
+        //   GGET 0 0;      (print — operand 0)
+        //   KSTR 2 1; KSTR 3 2; KSTR 4 3;   (3 args, operands 1, 2, 3)
+        //   CALL 0 1 4;    (B=1: 0 results; C=4: 3 args)
+        //   RET0.
+        // gc_consts file order (reverse-indexed): [c, b, a, print].
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Kstr, 2, 1),
+            ad(Opcode::Kstr, 3, 2),
+            ad(Opcode::Kstr, 4, 3),
+            abc(Opcode::Call, 0, 1, 4),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![
+                GcConst::Str(b"c".to_vec()),
+                GcConst::Str(b"b".to_vec()),
+                GcConst::Str(b"a".to_vec()),
+                GcConst::Str(b"print".to_vec()),
+            ],
+            Vec::new(),
+            5,
+        );
+        assert_eq!(emit(&module), "print(\"a\", \"b\", \"c\")");
+    }
+
+    /// `local x = tostring(42)` — single-result call whose result is
+    /// stored in a named local. The recovery routes through
+    /// [`assign_slot_ast`], which recognizes slot 0 as the
+    /// declaration point of `x` and pushes `Stmt::LocalDecl`.
+    #[test]
+    fn recover_call_result_in_local_decl() {
+        //   GGET  0 0      (tostring at slot 0)
+        //   KSHORT 2 42    (arg at slot 2; gap at slot 1)
+        //   CALL  0 2 2    (B=2: 1 result at slot 0; C=2: 1 arg)
+        //   RET0  0 1.
+        // var_info: x declared at real-idx 2 (the CALL), scope
+        // covers through the RET0.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Kshort, 2, 42),
+            abc(Opcode::Call, 0, 2, 2),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "x", 2, 3)],
+            vec![GcConst::Str(b"tostring".to_vec())],
+            Vec::new(),
+            3,
+        );
+        assert_eq!(emit(&module), "local x = tostring(42)");
+    }
+
+    /// `x = f(1)` — single-result call assigned to an existing
+    /// local. The CALL writes slot 0, but `x` is already in scope
+    /// (declared earlier), so [`assign_slot_ast`] pushes an Assign
+    /// (no `local`).
+    #[test]
+    fn recover_call_result_in_reassignment() {
+        //   KSHORT 0 0      (x = 0; declares x at real-idx 0)
+        //   GGET   1 0      (f at slot 1)
+        //   KSHORT 3 1      (arg at slot 3; gap at slot 2)
+        //   CALL   1 2 2    (B=2: 1 result at slot 1)
+        //   MOV    0 1      (x = result)
+        //   RET1   0 2.
+        //
+        // LuaJIT actually lowers `x = f(1)` this way — the call's
+        // result lands in a temp slot, then a MOV copies it into the
+        // named local. We use this shape to exercise the Assign path
+        // for a CALL RHS.
+        let insts = vec![
+            ad(Opcode::Kshort, 0, 0),
+            ad(Opcode::Gget, 1, 0),
+            ad(Opcode::Kshort, 3, 1),
+            abc(Opcode::Call, 1, 2, 2),
+            ad(Opcode::Mov, 0, 1),
+            ad(Opcode::Ret1, 0, 2),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "x", 0, 5)],
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            4,
+        );
+        assert_eq!(emit(&module), "local x = 0\nx = f(1)\nreturn x");
+    }
+
+    /// `return f(1)` shape — single-result call whose result is
+    /// immediately returned. The CALL writes slot 0 (an unnamed
+    /// temp), and the following RET1 reads slot 0. No Stmt is
+    /// emitted for the CALL itself; the call surfaces as
+    /// `Expr::Call` inside the `Return`.
+    #[test]
+    fn recover_call_result_returned() {
+        //   GGET   0 0      (f at slot 0)
+        //   KSHORT 2 1      (arg at slot 2)
+        //   CALL   0 2 2    (B=2: 1 result at slot 0)
+        //   RET1   0 2.
+        // No var_info at slot 0 → the CALL stores Expr::Call as an
+        // unnamed temp; RET1 reads it.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Kshort, 2, 1),
+            abc(Opcode::Call, 0, 2, 2),
+            ad(Opcode::Ret1, 0, 2),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            3,
+        );
+        assert_eq!(emit(&module), "return f(1)");
+    }
+
+    /// CALL with B == 0 (multres return — e.g. `local a, b, c = f()`)
+    /// bails with NotImplemented. Stage 15 territory.
+    #[test]
+    fn recover_call_multres_results_not_supported() {
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Kshort, 2, 1),
+            abc(Opcode::Call, 0, 0, 2), // B=0 → multres
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            3,
+        );
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for multres CALL (B=0), got {:?}",
+            result
+        );
+    }
+
+    /// CALL with C == 0 (multres args — e.g. `f(...)`) bails with
+    /// NotImplemented. Stage 15 territory.
+    #[test]
+    fn recover_call_multres_args_not_supported() {
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            abc(Opcode::Call, 0, 1, 0), // C=0 → multres args
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            1,
+        );
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for multres CALL (C=0), got {:?}",
+            result
+        );
+    }
+
+    /// CALL with B > 2 (multiple explicit results — e.g. the
+    /// `local a, b = f()` shape, where B = 3 means 2 results) bails
+    /// with NotImplemented.
+    #[test]
+    fn recover_call_multi_result_not_supported() {
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Kshort, 2, 1),
+            abc(Opcode::Call, 0, 3, 2), // B=3 → 2 results
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            3,
+        );
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for multi-result CALL (B=3), got {:?}",
+            result
+        );
+    }
+
+    /// CALL with an uninitialized argument slot bails with
+    /// NotImplemented — we can't reconstruct the call source.
+    #[test]
+    fn recover_call_uninitialized_arg_not_supported() {
+        //   GGET   0 0      (f at slot 0)
+        //   CALL   0 1 2    (C=2 → 1 arg at slot 2, but slot 2 was
+        //                    never written)
+        //   RET0.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            abc(Opcode::Call, 0, 1, 2),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            3,
+        );
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for CALL with uninitialized arg slot, got {:?}",
+            result
+        );
+    }
+
+    /// CALL with no function in the base slot bails with
+    /// NotImplemented.
+    #[test]
+    fn recover_call_no_function_in_base_slot_not_supported() {
+        // CALL at the top with slot 0 never written — lookup_operand
+        // fails on the func slot.
+        let insts = vec![abc(Opcode::Call, 0, 1, 1), ad(Opcode::Ret0, 0, 1)];
+        let module = module_with(insts, Vec::new(), Vec::new(), Vec::new(), 1);
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for CALL with no function in base slot, got {:?}",
+            result
+        );
     }
 }
