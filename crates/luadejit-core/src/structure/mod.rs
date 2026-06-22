@@ -57,6 +57,19 @@
 //! has A = destination, B = table, C = key. TSETM (multres table
 //! population for `{f()}`) is deferred to Stage 15.
 //!
+//! **Stage 15** adds function literals (FNEW), the length operator
+//! (LEN), and global assignment (GSET). FNEW resolves the child proto
+//! via [`resolve_child_proto`] (consulting the module's children-first
+//! post-order `protos` array), recursively calls [`recover`] on the
+//! child, and wraps the result in [`Expr::Function`]. Parameter names
+//! are extracted from the child's debug var_info (or synthetic `_1`,
+//! `_2`, ... when stripped). The recovery bails with
+//! [`DecompilerError::NotImplemented`] for upvalues (`numuv > 0`) and
+//! nested function children (a child with its own children) — both are
+//! deferred to later stages. LEN lowers to [`Expr::Len`]; GSET reuses
+//! [`Stmt::Assign`] (a global write is `name = value` at the source
+//! level).
+//!
 //! **Stage 11** adds `while cond do … end` and `repeat … until cond`
 //! support. Both are detected at the [`ConditionalBranch`] arm of
 //! [`recover_from`]:
@@ -102,7 +115,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::cfg::{BlockId, Cfg, InstructionId, Terminator};
-use crate::ir::{GcConst, Instruction, KtabK, NumConst, Opcode, Proto, TableConst};
+use crate::ir::{GcConst, Instruction, KtabK, Module, NumConst, Opcode, Proto, TableConst};
 use crate::DecompilerError;
 
 // ---- AST types -------------------------------------------------------
@@ -268,6 +281,20 @@ pub enum Expr {
     Table {
         entries: Vec<TableEntry>,
     },
+    /// The length operator `#expr` (Stage 15). Lowered from `LEN A D`
+    /// where `R[A] = #R[D]`.
+    Len(Box<Expr>),
+    /// A function literal `function(params) body end` (Stage 15).
+    /// Lowered from `FNEW A D`, which creates a closure from the
+    /// child proto referenced by `gc_consts[reverse(D)]` and stores
+    /// it in slot A. `params` holds the parameter names (extracted
+    /// from the child proto's debug var_info, or synthetic names
+    /// `_1`, `_2`, ... when debug info is absent); `body` holds the
+    /// recursively-recovered child statements.
+    Function {
+        params: Vec<String>,
+        body: Vec<Stmt>,
+    },
 }
 
 /// A table entry in a table literal (Stage 14).
@@ -334,14 +361,28 @@ pub enum BinOpKind {
 /// (`obj:method(args)`), and threads `is_fr2` through so the CALL
 /// handler honors the proto's frame convention. **Stage 14** adds
 /// table literals (`{}`, `{1, 2}`, `{a = 1}`) and table writes
-/// (`t.x = 1`, `t[0] = 1`).
+/// (`t.x = 1`, `t[0] = 1`). **Stage 15** adds function literals
+/// (`FNEW`), the length operator (`LEN`), and global assignment
+/// (`GSET`); FNEW recursively calls `recover` on the child proto,
+/// which requires threading the full `&Module` (not just the current
+/// proto) so child protos can be resolved.
 ///
 /// Unreachable blocks (e.g. the dead "skip-else" JMP LuaJIT emits
 /// after a returning then-body) are *not* rejected wholesale — they
 /// are part of the if/else structural signature. The walk simply
 /// never enters them: the recovery uses the dead JMP only to
 /// identify the merge target, never to process its instructions.
-pub fn recover(proto: &Proto, cfg: &Cfg, is_fr2: bool) -> Result<Vec<Stmt>, DecompilerError> {
+///
+/// `proto_idx` is the index of `proto` within `module.protos`. The
+/// FNEW handler uses `(module, proto_idx)` to resolve child protos
+/// via [`resolve_child_proto`].
+pub fn recover(
+    module: &Module,
+    proto_idx: usize,
+    cfg: &Cfg,
+    is_fr2: bool,
+) -> Result<Vec<Stmt>, DecompilerError> {
+    let proto = &module.protos[proto_idx];
     if cfg.blocks.is_empty() {
         return Ok(Vec::new());
     }
@@ -356,10 +397,25 @@ pub fn recover(proto: &Proto, cfg: &Cfg, is_fr2: bool) -> Result<Vec<Stmt>, Deco
         return Err(DecompilerError::NotImplemented);
     }
     let mut slot_exprs: HashMap<u8, Expr> = HashMap::new();
+    // Pre-populate parameters. The main chunk is vararg with
+    // numparams == 0, so this is a no-op for top-level recovery.
+    // Child protos reached via FNEW have numparams > 0 — their
+    // parameter slots (0..numparams-1) must resolve to the
+    // parameter names so that RET1/MOV/arithmetic reading a
+    // parameter slot produces `return x` / `x + y` rather than
+    // bailing on a missing slot expression.
+    if proto.numparams > 0 {
+        let params = extract_params(proto);
+        for (i, name) in params.iter().enumerate() {
+            slot_exprs.insert(i as u8, Expr::Var(name.clone()));
+        }
+    }
     let mut visited: HashSet<BlockId> = HashSet::new();
     let mut stmts = Vec::new();
     let mut ctx = RecoveryCtx {
+        module,
         proto,
+        proto_idx,
         cfg,
         is_fr2,
         slot_exprs: &mut slot_exprs,
@@ -452,11 +508,21 @@ fn cb_edges(cfg: &Cfg, block_id: BlockId) -> (BlockId, BlockId) {
     }
 }
 
-/// Walk-time shared state. Borrows the proto + cfg immutably and the
-/// slot map mutably for the duration of recovery. The lifetime is
-/// kept internal to this module: callers go through [`recover`].
+/// Walk-time shared state. Borrows the module + proto + cfg immutably
+/// and the slot map mutably for the duration of recovery. The lifetime
+/// is kept internal to this module: callers go through [`recover`].
 struct RecoveryCtx<'a> {
+    /// The full module. Stage 15's FNEW handler needs this to resolve
+    /// child protos (which live at earlier indices in
+    /// `module.protos`, per the children-first post-order layout).
+    module: &'a Module,
+    /// The proto currently being recovered. Derived from
+    /// `module.protos[proto_idx]`; stored separately so the many
+    /// handlers that only need `&Proto` don't have to re-index.
     proto: &'a Proto,
+    /// The index of `proto` within `module.protos`. Used by the FNEW
+    /// handler (together with `module`) to locate child protos.
+    proto_idx: usize,
     cfg: &'a Cfg,
     /// Whether this proto uses the FR2 (two-slot) frame convention.
     /// FR2 leaves a one-slot gap between a CALL's function slot (A)
@@ -1409,9 +1475,169 @@ fn process_inst(
                 value,
             });
         }
+        Opcode::Len => {
+            // LEN A D (AD format): `R[A] = #R[D]`. D is the source
+            // register. Stage 15.
+            let source = lookup_operand(ctx.slot_exprs, inst.d() as u8)?;
+            let len_expr = Expr::Len(Box::new(source));
+            assign_slot_ast(ctx.proto, ctx.slot_exprs, stmts, inst.a, len_expr, real_idx);
+        }
+        Opcode::Gset => {
+            // GSET A D (AD format): `globals[KSTR[reverse(D)]] = R[A]`.
+            // A is the value register, D is a reverse-indexed GC
+            // string constant (the global name). Stage 15 reuses
+            // Stmt::Assign — at the Lua source level a global write
+            // is just `name = value`.
+            let value = lookup_operand(ctx.slot_exprs, inst.a)?;
+            let gc = ctx.proto.gc_const_for_operand(inst.d())?;
+            let name = match gc {
+                GcConst::Str(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                _ => return Err(DecompilerError::NotImplemented),
+            };
+            stmts.push(Stmt::Assign { name, expr: value });
+        }
+        Opcode::Fnew => {
+            // FNEW A D (AD format): create a closure from the child
+            // proto referenced by gc_consts[reverse(D)] and store it
+            // in slot A. Stage 15.
+            //
+            // The child proto is resolved via resolve_child_proto,
+            // which consults the full module (child protos live at
+            // earlier indices in module.protos per the
+            // children-first post-order layout). The child's body is
+            // recovered via a recursive recover() call, then wrapped
+            // in Expr::Function.
+            //
+            // Bail with NotImplemented for:
+            // - upvalues (numuv > 0) — deferred to a later stage
+            // - nested children (the child has its own children) —
+            //   the simple-case index formula doesn't apply
+            let child_idx = resolve_child_proto(ctx.module, ctx.proto_idx, inst.d())?;
+            let child = &ctx.module.protos[child_idx];
+            // Upvalue capture is out of scope for Stage 15.
+            if !child.upvalues.is_empty() {
+                return Err(DecompilerError::NotImplemented);
+            }
+            // Recursively recover the child's body. A fresh
+            // slot_exprs / visited set is created inside recover.
+            let child_cfg = Cfg::build(child);
+            let body = recover(ctx.module, child_idx, &child_cfg, ctx.is_fr2)?;
+            let params = extract_params(child);
+            let func_expr = Expr::Function { params, body };
+            assign_slot_ast(
+                ctx.proto,
+                ctx.slot_exprs,
+                stmts,
+                inst.a,
+                func_expr,
+                real_idx,
+            );
+        }
         _ => return Err(DecompilerError::NotImplemented),
     }
     Ok(())
+}
+
+/// Resolve a FNEW's child proto to its index in `module.protos`.
+///
+/// FNEW A D references the child proto whose marker is at
+/// `gc_consts[reverse(D)]`. The marker must be [`GcConst::Child`].
+///
+/// # Child-proto resolution algorithm (simple case)
+///
+/// The module's `protos` vector is in children-first post-order: the
+/// parent (current proto) is at `parent_idx`, and its children are
+/// the protos immediately before it. LuaJIT emits `GcConst::Child`
+/// markers in the parent's gc_consts in **reverse** of the protos
+/// declaration order, which aligns with the reverse-indexed D
+/// operand: FNEW D=0 hits the last gc_consts entry (the first
+/// declared child), D=1 hits the second-to-last (the second child),
+/// and so on.
+///
+/// To map FNEW's D to a proto index:
+/// 1. Compute `target_gc_idx = gc_consts.len() - 1 - D` (the
+///    reverse-index lookup, same as `gc_const_for_operand`).
+/// 2. Count how many `GcConst::Child` markers appear at file indices
+///    `0..=target_gc_idx`. Call this count `k` (1-indexed position
+///    among Child markers in gc_consts file order).
+/// 3. The Child markers are in reverse declaration order, so the
+///    k-th marker (1-indexed, file order) is the (C - k)-th declared
+///    child (0-indexed), which lives at `protos[parent_idx - C + (C
+///    - k)] = protos[parent_idx - k]`. Equivalently, with K = k - 1
+///    (0-indexed in file order): `protos[parent_idx - 1 - K]`.
+///
+/// # Nested children
+///
+/// The formula above assumes all of the parent's children are leaves
+/// (none has its own `GcConst::Child` markers). If a child has
+/// descendants, the protos layout has grandchildren interspersed
+/// before the child, shifting indices and invalidating the formula.
+/// Stage 15 detects this by checking that no proto before
+/// `parent_idx` carries Child markers — if any does, bail with
+/// [`DecompilerError::NotImplemented`].
+fn resolve_child_proto(
+    module: &Module,
+    parent_idx: usize,
+    fnew_d: u16,
+) -> Result<usize, DecompilerError> {
+    let parent = &module.protos[parent_idx];
+    // Step 1: the gc_consts entry must be a Child marker.
+    let gc = parent.gc_const_for_operand(fnew_d)?;
+    if !matches!(gc, GcConst::Child) {
+        return Err(DecompilerError::NotImplemented);
+    }
+    // Step 2: detect nesting. If any proto before the parent has its
+    // own children, the simple-case index formula doesn't apply.
+    for proto in &module.protos[..parent_idx] {
+        if proto.gc_consts.iter().any(|c| matches!(c, GcConst::Child)) {
+            return Err(DecompilerError::NotImplemented);
+        }
+    }
+    // Step 3: compute the gc_consts file index of the target Child
+    // marker, then count Child markers up to and including it.
+    let len = parent.gc_consts.len();
+    let target_gc_idx = len
+        .checked_sub((fnew_d as usize) + 1)
+        .ok_or(DecompilerError::NotImplemented)?;
+    let k_one_indexed = parent.gc_consts[..=target_gc_idx]
+        .iter()
+        .filter(|c| matches!(c, GcConst::Child))
+        .count();
+    let k = k_one_indexed - 1; // 0-indexed in file order
+                               // Step 4: map to proto index. In the simple case, the k-th
+                               // Child marker (0-indexed, file order) corresponds to
+                               // protos[parent_idx - 1 - k].
+    Ok(parent_idx - 1 - k)
+}
+
+/// Extract parameter names for a child proto.
+///
+/// The child's debug `var_info` carries records with
+/// `is_parameter == true`; the first `numparams` such records (in
+/// var_info order) name the parameters. When debug info is absent
+/// (stripped proto) or doesn't carry enough parameter names, fall
+/// back to synthetic names `_1`, `_2`, ... so decompilation doesn't
+/// bail just because names were stripped.
+fn extract_params(child: &Proto) -> Vec<String> {
+    let numparams = child.numparams as usize;
+    if numparams == 0 {
+        return Vec::new();
+    }
+    if let Some(debug) = &child.debug {
+        let params: Vec<String> = debug
+            .var_info
+            .iter()
+            .filter(|v| v.is_parameter)
+            .take(numparams)
+            .filter_map(|v| v.name.clone())
+            .collect();
+        if params.len() == numparams {
+            return params;
+        }
+    }
+    // Fallback: synthetic names. Matches the spec's suggestion of
+    // `_1`, `_2`, ... when debug info is absent or incomplete.
+    (1..=numparams).map(|i| format!("_{}", i)).collect()
 }
 
 /// Read a slot's [`Expr`] without removing it. Used by method-call
@@ -2800,7 +3026,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
 
         assert_eq!(ast.len(), 1, "expected just [If] (implicit RET0 → no Stmt)");
         match &ast[0] {
@@ -2964,7 +3190,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
 
         assert_eq!(ast.len(), 1, "expected just [If] (implicit RET0 → no Stmt)");
         match &ast[0] {
@@ -3600,7 +3826,7 @@ mod tests {
         let module = and_chain_module();
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [If]");
         match &ast[0] {
             Stmt::If {
@@ -3634,7 +3860,7 @@ mod tests {
         let module = or_chain_module();
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [If]");
         match &ast[0] {
             Stmt::If {
@@ -3947,7 +4173,7 @@ mod tests {
         let module = for_loop_module(standard_for_loop_var_info());
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
 
         assert_eq!(ast.len(), 1, "expected just [For] (implicit RET0)");
         match &ast[0] {
@@ -3989,7 +4215,7 @@ mod tests {
         // AST: step is Some(Int(2)).
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
         match &ast[0] {
             Stmt::For { step, .. } => {
                 assert_eq!(*step, Some(Expr::Int(2)), "step should be Int(2)");
@@ -4054,6 +4280,17 @@ mod tests {
                 ..DebugInfo::default()
             }),
         };
+        // Wrap in a single-proto module (the recover signature takes
+        // &Module + proto_idx so the FNEW handler can locate child
+        // protos — this test has no FNEW but the signature is uniform).
+        use crate::ir::{Module, ModuleHeader};
+        let module = Module {
+            header: ModuleHeader {
+                flags: crate::ir::FLAG_FR2,
+                chunkname: None,
+            },
+            protos: vec![proto],
+        };
         // Synthetic CFG: a single block that is its own loop body.
         // Not a shape the CFG builder would ever produce, but exactly
         // the kind of unexpected cycle the safety net must catch.
@@ -4079,7 +4316,7 @@ mod tests {
             }],
             entry: BlockId(0),
         };
-        let result = recover(&proto, &cfg, true);
+        let result = recover(&module, 0, &cfg, true);
         assert!(
             matches!(result, Err(DecompilerError::NotImplemented)),
             "expected NotImplemented on synthetic self-referential LoopInit, got {:?}",
@@ -4214,7 +4451,7 @@ mod tests {
         let module = while_loop_module(10, true);
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
 
         assert_eq!(ast.len(), 3, "expected [LocalDecl, While, Return]");
         match &ast[0] {
@@ -4317,7 +4554,7 @@ mod tests {
         let module = repeat_loop_module(3);
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
 
         assert_eq!(ast.len(), 3, "expected [LocalDecl, Repeat, Return]");
         match &ast[0] {
@@ -4394,7 +4631,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [If]");
         assert!(
             matches!(ast[0], Stmt::If { .. }),
@@ -4433,7 +4670,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [If]");
         assert!(
             matches!(ast[0], Stmt::If { .. }),
@@ -4558,7 +4795,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
         assert_eq!(
             ast.len(),
             1,
@@ -5128,7 +5365,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
         assert_eq!(
             ast.len(),
             1,
@@ -5166,7 +5403,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [Return]");
         match &ast[0] {
             Stmt::Return(Some(expr)) => {
@@ -5725,7 +5962,7 @@ mod tests {
         let module = module_with(insts, Vec::new(), Vec::new(), Vec::new(), 1);
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [Return]");
         match &ast[0] {
             Stmt::Return(Some(expr)) => {
@@ -5752,7 +5989,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [Return]");
         match &ast[0] {
             Stmt::Return(Some(expr)) => {
@@ -5789,7 +6026,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [TableSet]");
         match &ast[0] {
             Stmt::TableSet { target, value } => {
@@ -5805,5 +6042,395 @@ mod tests {
             }
             other => panic!("expected TableSet, got {:?}", other),
         }
+    }
+
+    // ====================================================================
+    // Stage 15: LEN, GSET, FNEW (function literals)
+    // ====================================================================
+
+    /// Build a `Module` with two protos: a child (the function body)
+    /// and the main chunk that references it via FNEW. The child
+    /// carries the given `child_insts`, `child_var_info`, and
+    /// `child_numparams`; the main carries `main_insts`,
+    /// `main_var_info`, and a single `GcConst::Child` marker in its
+    /// gc_consts (referenced by FNEW D=0).
+    fn module_with_child(
+        child_insts: Vec<Instruction>,
+        child_var_info: Vec<VarInfo>,
+        child_numparams: u8,
+        child_framesize: u8,
+        main_insts: Vec<Instruction>,
+        main_var_info: Vec<VarInfo>,
+        main_framesize: u8,
+    ) -> Module {
+        use crate::ir::FLAG_FR2;
+        // Child proto: no upvalues, no children of its own.
+        let mut child_insts_full = vec![Instruction::synthetic_header(
+            Opcode::Funcf,
+            child_framesize,
+        )];
+        child_insts_full.extend(child_insts);
+        let child = Proto {
+            flags: 0,
+            numparams: child_numparams,
+            framesize: child_framesize,
+            upvalues: Vec::<UpvalDesc>::new(),
+            gc_consts: Vec::new(),
+            num_consts: Vec::new(),
+            insts: child_insts_full,
+            debug: Some(DebugInfo {
+                var_info: child_var_info,
+                ..DebugInfo::default()
+            }),
+        };
+        // Main proto: carries one GcConst::Child marker for the FNEW.
+        let mut main_insts_full =
+            vec![Instruction::synthetic_header(Opcode::Funcv, main_framesize)];
+        main_insts_full.extend(main_insts);
+        let main = Proto {
+            flags: crate::ir::PROTO_CHILD,
+            numparams: 0,
+            framesize: main_framesize,
+            upvalues: Vec::<UpvalDesc>::new(),
+            gc_consts: vec![GcConst::Child],
+            num_consts: Vec::new(),
+            insts: main_insts_full,
+            debug: Some(DebugInfo {
+                var_info: main_var_info,
+                ..DebugInfo::default()
+            }),
+        };
+        Module {
+            header: ModuleHeader {
+                flags: FLAG_FR2,
+                chunkname: None,
+            },
+            protos: vec![child, main],
+        }
+    }
+
+    /// Build a VarInfo record for a parameter named `name` at `slot`.
+    fn param_local(slot: u8, name: &str) -> VarInfo {
+        VarInfo {
+            kind: VarKind::Name,
+            name: Some(name.to_string()),
+            is_parameter: true,
+            slot,
+            scope_begin: 0,
+            scope_end: 100,
+        }
+    }
+
+    // ---- LEN (length operator) ---------------------------------------
+
+    #[test]
+    fn emit_len_on_global() {
+        // `local x = #t`:
+        //   GGET  0 0    ; t → slot 0
+        //   LEN   0 0    ; R[0] = #R[0]
+        //   RET0  0 1.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Len, 0, 0),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "x", 1, 2)],
+            vec![GcConst::Str(b"t".to_vec())],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "local x = #t");
+    }
+
+    #[test]
+    fn recover_len_ast_shape() {
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Len, 1, 0), // LEN writes to slot 1
+            ad(Opcode::Ret1, 1, 2),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"t".to_vec())],
+            Vec::new(),
+            2,
+        );
+        let cfg = Cfg::build(module.main_proto());
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        assert_eq!(ast.len(), 1, "expected just [Return]");
+        match &ast[0] {
+            Stmt::Return(Some(expr)) => {
+                assert_eq!(*expr, Expr::Len(Box::new(Expr::Global("t".to_string()))));
+            }
+            other => panic!("expected Return(Some(Len)), got {:?}", other),
+        }
+    }
+
+    // ---- GSET (global assignment) ------------------------------------
+
+    #[test]
+    fn emit_gset_simple() {
+        // `x = 42`:
+        //   KSHORT 0 42
+        //   GSET   0 0
+        //   RET0   0 1.
+        let insts = vec![
+            ad(Opcode::Kshort, 0, 42),
+            ad(Opcode::Gset, 0, 0),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"x".to_vec())],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "x = 42");
+    }
+
+    #[test]
+    fn recover_gset_ast_shape() {
+        let insts = vec![
+            ad(Opcode::Kshort, 0, 7),
+            ad(Opcode::Gset, 0, 0),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"y".to_vec())],
+            Vec::new(),
+            1,
+        );
+        let cfg = Cfg::build(module.main_proto());
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        assert_eq!(ast.len(), 1, "expected just [Assign]");
+        match &ast[0] {
+            Stmt::Assign { name, expr } => {
+                assert_eq!(name, "y");
+                assert_eq!(*expr, Expr::Int(7));
+            }
+            other => panic!("expected Assign, got {:?}", other),
+        }
+    }
+
+    // ---- FNEW (function literals) ------------------------------------
+
+    #[test]
+    fn emit_fnew_simple() {
+        // `local f = function() return 1 end`:
+        let module = module_with_child(
+            // child: KSHORT 0 1; RET1 0 2.
+            vec![ad(Opcode::Kshort, 0, 1), ad(Opcode::Ret1, 0, 2)],
+            Vec::new(),
+            0, // numparams
+            1, // framesize
+            // main: FNEW 0 0; RET0 0 1.
+            vec![ad(Opcode::Fnew, 0, 0), ad(Opcode::Ret0, 0, 1)],
+            vec![named_local(0, "f", 0, 1)],
+            1,
+        );
+        assert_eq!(emit(&module), "local f = function()\n    return 1\nend");
+    }
+
+    #[test]
+    fn emit_fnew_with_param() {
+        // `local f = function(x) return x end`:
+        let module = module_with_child(
+            // child: RET1 0 2 (returns param x at slot 0).
+            vec![ad(Opcode::Ret1, 0, 2)],
+            vec![param_local(0, "x")],
+            1, // numparams
+            1, // framesize
+            // main: FNEW 0 0; RET0 0 1.
+            vec![ad(Opcode::Fnew, 0, 0), ad(Opcode::Ret0, 0, 1)],
+            vec![named_local(0, "f", 0, 1)],
+            1,
+        );
+        assert_eq!(emit(&module), "local f = function(x)\n    return x\nend");
+    }
+
+    #[test]
+    fn emit_fnew_two_params() {
+        // `local f = function(x, y) return x + y end`:
+        let module = module_with_child(
+            // child: ADDVV 2 0 1; RET1 2 2.
+            vec![abc(Opcode::Addvv, 2, 0, 1), ad(Opcode::Ret1, 2, 2)],
+            vec![param_local(0, "x"), param_local(1, "y")],
+            2, // numparams
+            3, // framesize
+            // main: FNEW 0 0; RET0 0 1.
+            vec![ad(Opcode::Fnew, 0, 0), ad(Opcode::Ret0, 0, 1)],
+            vec![named_local(0, "f", 0, 1)],
+            1,
+        );
+        assert_eq!(
+            emit(&module),
+            "local f = function(x, y)\n    return x + y\nend"
+        );
+    }
+
+    #[test]
+    fn recover_fnew_ast_shape() {
+        // Verify the Expr::Function payload directly.
+        let module = module_with_child(
+            vec![ad(Opcode::Kshort, 0, 42), ad(Opcode::Ret1, 0, 2)],
+            Vec::new(),
+            0,
+            1,
+            vec![ad(Opcode::Fnew, 0, 0), ad(Opcode::Ret0, 0, 1)],
+            vec![named_local(0, "f", 0, 1)],
+            1,
+        );
+        let cfg = Cfg::build(module.main_proto());
+        let ast = recover(&module, 1, &cfg, true).expect("recover should succeed");
+        assert_eq!(ast.len(), 1, "expected just [LocalDecl]");
+        match &ast[0] {
+            Stmt::LocalDecl { name, expr } => {
+                assert_eq!(name, "f");
+                match expr {
+                    Expr::Function { params, body } => {
+                        assert!(params.is_empty(), "expected no params");
+                        assert_eq!(body.len(), 1, "expected one body stmt");
+                        match &body[0] {
+                            Stmt::Return(Some(expr)) => {
+                                assert_eq!(*expr, Expr::Int(42));
+                            }
+                            other => panic!("expected Return(Some(42)), got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected Function, got {:?}", other),
+                }
+            }
+            other => panic!("expected LocalDecl, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn recover_fnew_bails_on_upvalues() {
+        // A child with numuv > 0 must bail with NotImplemented.
+        use crate::ir::UpvalDesc;
+        let mut module = module_with_child(
+            vec![ad(Opcode::Ret0, 0, 1)],
+            Vec::new(),
+            0,
+            1,
+            vec![ad(Opcode::Fnew, 0, 0), ad(Opcode::Ret0, 0, 1)],
+            vec![named_local(0, "f", 0, 1)],
+            1,
+        );
+        // Inject an upvalue into the child proto.
+        module.protos[0].upvalues.push(UpvalDesc { raw: 0x8000 });
+        let cfg = Cfg::build(module.main_proto());
+        let result = recover(&module, 1, &cfg, true);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for upvalues, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn recover_fnew_bails_on_nested_children() {
+        // A module where the child proto has its own Child marker —
+        // the simple-case resolution formula doesn't apply.
+        let mut module = module_with_child(
+            vec![ad(Opcode::Ret0, 0, 1)],
+            Vec::new(),
+            0,
+            1,
+            vec![ad(Opcode::Fnew, 0, 0), ad(Opcode::Ret0, 0, 1)],
+            vec![named_local(0, "f", 0, 1)],
+            1,
+        );
+        // Give the child a Child marker of its own (it's now a
+        // grandparent). This trips the nesting check in
+        // resolve_child_proto.
+        module.protos[0].gc_consts.push(GcConst::Child);
+        let cfg = Cfg::build(module.main_proto());
+        let result = recover(&module, 1, &cfg, true);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for nested children, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn recover_fnew_bails_on_non_child_gc() {
+        // FNEW whose gc_const isn't a Child marker → NotImplemented.
+        let module = module_with(
+            vec![ad(Opcode::Fnew, 0, 0), ad(Opcode::Ret0, 0, 1)],
+            vec![named_local(0, "f", 0, 1)],
+            vec![GcConst::Str(b"not_a_child".to_vec())], // wrong type
+            Vec::new(),
+            1,
+        );
+        let cfg = Cfg::build(module.main_proto());
+        let result = recover(&module, 0, &cfg, true);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for non-Child gc_const, got {:?}",
+            result
+        );
+    }
+
+    // ---- extract_params (parameter-name extraction) ------------------
+
+    #[test]
+    fn extract_params_uses_debug_names() {
+        // A proto with 2 params named "x" and "y" at slots 0 and 1.
+        let proto = Proto {
+            flags: 0,
+            numparams: 2,
+            framesize: 2,
+            upvalues: Vec::new(),
+            gc_consts: Vec::new(),
+            num_consts: Vec::new(),
+            insts: Vec::new(),
+            debug: Some(DebugInfo {
+                var_info: vec![param_local(0, "x"), param_local(1, "y")],
+                ..DebugInfo::default()
+            }),
+        };
+        let params = extract_params(&proto);
+        assert_eq!(params, vec!["x".to_string(), "y".to_string()]);
+    }
+
+    #[test]
+    fn extract_params_synthetic_when_no_debug() {
+        // A stripped proto (no debug) → synthetic names _1, _2.
+        let proto = Proto {
+            flags: 0,
+            numparams: 2,
+            framesize: 2,
+            upvalues: Vec::new(),
+            gc_consts: Vec::new(),
+            num_consts: Vec::new(),
+            insts: Vec::new(),
+            debug: None,
+        };
+        let params = extract_params(&proto);
+        assert_eq!(params, vec!["_1".to_string(), "_2".to_string()]);
+    }
+
+    #[test]
+    fn extract_params_empty_for_zero_params() {
+        let proto = Proto {
+            flags: 0,
+            numparams: 0,
+            framesize: 0,
+            upvalues: Vec::new(),
+            gc_consts: Vec::new(),
+            num_consts: Vec::new(),
+            insts: Vec::new(),
+            debug: None,
+        };
+        let params = extract_params(&proto);
+        assert!(params.is_empty());
     }
 }
