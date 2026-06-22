@@ -36,6 +36,15 @@
 //! bailouts; method calls (Stage 13) and multres (Stage 15) are
 //! deferred.
 //!
+//! **Stage 13** adds field access (`obj.field`, `obj[5]`, `t[k]`)
+//! via TGETS/TGETB/TGETV and method-call detection (`obj:m(1)`).
+//! The recovery detects method calls at the CALL handler: when the
+//! function slot holds `Expr::Field` and the self slot (A+2 in FR2,
+//! A+1 in FR1) holds the Field's `obj`, the CALL desugars to
+//! `obj:method(args)` with the implicit self dropped. Stage 13 also
+//! fixes the FR1/FR2 argument-base bug — the CALL handler now honors
+//! the proto's frame convention instead of assuming FR2.
+//!
 //! **Stage 11** adds `while cond do … end` and `repeat … until cond`
 //! support. Both are detected at the [`ConditionalBranch`] arm of
 //! [`recover_from`]:
@@ -131,6 +140,15 @@ pub enum Stmt {
     /// actually used, the call surfaces as an [`Expr::Call`] inside
     /// another statement (LocalDecl / Assign / Return) instead.
     Call { func: Expr, args: Vec<Expr> },
+    /// A bare method call whose result is discarded (Stage 13):
+    /// `obj:method(1)`. Same routing logic as [`Stmt::Call`]: when
+    /// the call has a single result that's used, it surfaces as an
+    /// [`Expr::MethodCall`] inside another statement instead.
+    MethodCall {
+        obj: Expr,
+        method: String,
+        args: Vec<Expr>,
+    },
 }
 
 /// A Lua expression. Stage 7's variants cover the values Stages 1-6
@@ -196,6 +214,32 @@ pub enum Expr {
         func: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// `obj.field` — table field access via string key (Stage 13).
+    /// Lowered from `TGETS A B C` where C is a reverse-indexed
+    /// GC string constant; the source operand is `slot[B]` and the
+    /// field name is the constant.
+    Field {
+        obj: Box<Expr>,
+        name: String,
+    },
+    /// `obj[key]` — table index access (Stage 13). Lowered from
+    /// `TGETB A B C` (key is an inline integer literal in C) or
+    /// `TGETV A B C` (key is `slot[C]`).
+    Index {
+        obj: Box<Expr>,
+        key: Box<Expr>,
+    },
+    /// `obj:method(args...)` — method call with implicit self
+    /// (Stage 13). Lowered from a `CALL` whose base slot holds an
+    /// [`Expr::Field`] and whose self slot (A+2 in FR2, A+1 in FR1)
+    /// matches the Field's `obj`. The recovery drops the implicit
+    /// self from the arg list — only explicit source arguments
+    /// appear here.
+    MethodCall {
+        obj: Box<Expr>,
+        method: String,
+        args: Vec<Expr>,
+    },
 }
 
 /// The binary operator kind attached to [`Expr::BinOp`]. Stage 7
@@ -241,14 +285,17 @@ pub enum BinOpKind {
 /// `if/else`, compound `and`/`or` conditions, and numeric-`for`
 /// loops. **Stage 11** adds `while`/`repeat` loops with simple
 /// single-condition headers. **Stage 12** adds regular (non-tail,
-/// non-multres, non-method) function calls.
+/// non-multres, non-method) function calls. **Stage 13** adds
+/// field access (`obj.field`, `obj[k]`) and method-call detection
+/// (`obj:method(args)`), and threads `is_fr2` through so the CALL
+/// handler honors the proto's frame convention.
 ///
 /// Unreachable blocks (e.g. the dead "skip-else" JMP LuaJIT emits
 /// after a returning then-body) are *not* rejected wholesale — they
 /// are part of the if/else structural signature. The walk simply
 /// never enters them: the recovery uses the dead JMP only to
 /// identify the merge target, never to process its instructions.
-pub fn recover(proto: &Proto, cfg: &Cfg) -> Result<Vec<Stmt>, DecompilerError> {
+pub fn recover(proto: &Proto, cfg: &Cfg, is_fr2: bool) -> Result<Vec<Stmt>, DecompilerError> {
     if cfg.blocks.is_empty() {
         return Ok(Vec::new());
     }
@@ -268,6 +315,7 @@ pub fn recover(proto: &Proto, cfg: &Cfg) -> Result<Vec<Stmt>, DecompilerError> {
     let mut ctx = RecoveryCtx {
         proto,
         cfg,
+        is_fr2,
         slot_exprs: &mut slot_exprs,
         visited: &mut visited,
     };
@@ -364,6 +412,13 @@ fn cb_edges(cfg: &Cfg, block_id: BlockId) -> (BlockId, BlockId) {
 struct RecoveryCtx<'a> {
     proto: &'a Proto,
     cfg: &'a Cfg,
+    /// Whether this proto uses the FR2 (two-slot) frame convention.
+    /// FR2 leaves a one-slot gap between a CALL's function slot (A)
+    /// and its first argument slot (A+2). FR1 (no gap) packs args
+    /// starting at A+1. All Darktide-corpus protos are FR1; the
+    /// system-luajit fixtures in the test suite are FR2. Threaded
+    /// through from [`emit_module`], which reads `module.header.is_fr2()`.
+    is_fr2: bool,
     slot_exprs: &'a mut HashMap<u8, Expr>,
     /// Blocks already entered by some `recover_from` invocation on the
     /// current recovery walk. Stage 10's safety mechanism: any
@@ -1068,63 +1123,175 @@ fn process_inst(
             //             (B == 0 means multres — Stage 15).
             //   - C-1   = number of arguments (C == 0 means multres
             //             call from a VARG/previous CALL — Stage 15).
-            // Arguments occupy slots A+2..=A+C (note the gap: slot
-            // A+1 is unused for regular calls). Results overwrite
-            // slots starting at A.
+            // Arguments occupy slots arg_base..=A+C where arg_base is
+            // A+2 in FR2 (gap at A+1) or A+1 in FR1 (no gap). Results
+            // overwrite slots starting at A.
             //
             // Stage 12 only models the regular cases: zero or one
             // explicit results, and a fixed (non-multres) argument
             // list. Tail calls (CALLT/CALLMT) are CFG terminators
             // handled in the recovery walk (they bail with
-            // NotImplemented); method calls (Stage 13) and multres
-            // (Stage 15) are deferred.
+            // NotImplemented); multres (Stage 15) is deferred. Stage
+            // 13 adds method-call detection: a CALL whose base slot
+            // holds `Expr::Field { obj, name }` and whose self slot
+            // (arg_base) holds `obj` desugars to `obj:name(args)`.
             if inst.b() == 0 || inst.c == 0 {
                 return Err(DecompilerError::NotImplemented);
             }
+            // FR1 (Darktide corpus) packs args at A+1; FR2 (system
+            // luajit test fixtures) leaves a gap and packs args at
+            // A+2. The same base slot also identifies the self
+            // register for method calls.
+            let arg_base = if ctx.is_fr2 { inst.a + 2 } else { inst.a + 1 };
             let func = lookup_operand(ctx.slot_exprs, inst.a)?;
-            let arg_count = (inst.c - 1) as usize;
-            let mut args = Vec::with_capacity(arg_count);
-            for slot in (inst.a + 2)..=(inst.a + inst.c) {
-                args.push(lookup_operand(ctx.slot_exprs, slot)?);
+            // Method-call detection. The compiler lowers
+            // `obj:method(args...)` to:
+            //   MOV arg_base, obj_slot   ; self = obj
+            //   TGETS A, obj_slot, name  ; A = obj.method
+            //   [<arg loads into arg_base+1..A+C>]
+            //   CALL A, B, C
+            // We detect this by checking (1) the base slot holds a
+            // Field, and (2) the self slot holds the Field's obj.
+            // When both hold, the user wrote `obj:name(args)`; drop
+            // the implicit self from the arg list.
+            let method_call = match &func {
+                Expr::Field { obj, name } => slot_exprs_get(ctx.slot_exprs, arg_base)
+                    .is_some_and(|self_expr| self_expr == obj.as_ref())
+                    .then(|| (obj.as_ref().clone(), name.clone())),
+                _ => None,
+            };
+            if let Some((obj, method)) = method_call {
+                // Explicit args start at arg_base+1 (skipping self).
+                // Count = C-2: subtract 1 for the C-1 convention, 1
+                // for the implicit self. Range is
+                // `(arg_base+1)..(arg_base+1 + explicit_count)`.
+                let explicit_arg_count = (inst.c as usize).saturating_sub(2);
+                let explicit_end = arg_base
+                    .saturating_add(1)
+                    .saturating_add(explicit_arg_count as u8);
+                let mut args = Vec::with_capacity(explicit_arg_count);
+                for slot in (arg_base + 1)..explicit_end {
+                    args.push(lookup_operand(ctx.slot_exprs, slot)?);
+                }
+                let result_count = inst.b() - 1;
+                match result_count {
+                    0 => {
+                        // Result discarded — emit a bare method call.
+                        stmts.push(Stmt::MethodCall { obj, method, args });
+                    }
+                    1 => {
+                        // Single result stored at slot A. Route
+                        // through assign_slot_ast so the destination
+                        // is recognized as `local x = obj:m(...)`,
+                        // `x = obj:m(...)`, or an unnamed temp.
+                        let call_expr = Expr::MethodCall {
+                            obj: Box::new(obj),
+                            method,
+                            args,
+                        };
+                        assign_slot_ast(
+                            ctx.proto,
+                            ctx.slot_exprs,
+                            stmts,
+                            inst.a,
+                            call_expr,
+                            real_idx,
+                        );
+                    }
+                    _ => {
+                        // Multiple return values — Stage 15.
+                        return Err(DecompilerError::NotImplemented);
+                    }
+                }
+            } else {
+                // Regular call: C-1 args packed at
+                // `arg_base..arg_base + arg_count`.
+                let arg_count = (inst.c - 1) as usize;
+                let args_end = arg_base.saturating_add(arg_count as u8);
+                let mut args = Vec::with_capacity(arg_count);
+                for slot in arg_base..args_end {
+                    args.push(lookup_operand(ctx.slot_exprs, slot)?);
+                }
+                let result_count = inst.b() - 1;
+                match result_count {
+                    0 => {
+                        // Result discarded — emit a bare call. No slot
+                        // update needed: nothing was stored.
+                        stmts.push(Stmt::Call { func, args });
+                    }
+                    1 => {
+                        // Single result stored at slot A. Route
+                        // through assign_slot_ast so the destination
+                        // is recognized as `local x = f(...)`,
+                        // `x = f(...)`, or an unnamed temp.
+                        let call_expr = Expr::Call {
+                            func: Box::new(func),
+                            args,
+                        };
+                        assign_slot_ast(
+                            ctx.proto,
+                            ctx.slot_exprs,
+                            stmts,
+                            inst.a,
+                            call_expr,
+                            real_idx,
+                        );
+                    }
+                    _ => {
+                        // Multiple return values (e.g.
+                        // `local a, b = f()`) — Stage 15.
+                        return Err(DecompilerError::NotImplemented);
+                    }
+                }
             }
-            let result_count = inst.b() - 1;
-            match result_count {
-                0 => {
-                    // Result discarded — emit a bare call statement.
-                    // No slot update needed: nothing was stored.
-                    stmts.push(Stmt::Call { func, args });
-                }
-                1 => {
-                    // Single result stored at slot A. Route through
-                    // assign_slot_ast so the destination is
-                    // recognized as a `local x = f(...)` declaration,
-                    // an `x = f(...)` reassignment, or an unnamed
-                    // temp (the latter emits no line; the call
-                    // surfaces later via the slot map, e.g. as
-                    // `return f(...)`).
-                    let call_expr = Expr::Call {
-                        func: Box::new(func),
-                        args,
-                    };
-                    assign_slot_ast(
-                        ctx.proto,
-                        ctx.slot_exprs,
-                        stmts,
-                        inst.a,
-                        call_expr,
-                        real_idx,
-                    );
-                }
-                _ => {
-                    // Multiple return values (e.g. `local a, b = f()`)
-                    // — Stage 15.
-                    return Err(DecompilerError::NotImplemented);
-                }
-            }
+        }
+        Opcode::Tgets => {
+            // TGETS A B C — `R[A] = R[B][KSTR[reverse(C)]]`. C is a
+            // reverse-indexed GC string constant (the field name).
+            let gc = ctx.proto.gc_const_for_operand(inst.c as u16)?;
+            let name = match gc {
+                GcConst::Str(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                _ => return Err(DecompilerError::NotImplemented),
+            };
+            let obj = lookup_operand(ctx.slot_exprs, inst.b())?;
+            let expr = Expr::Field {
+                obj: Box::new(obj),
+                name,
+            };
+            assign_slot_ast(ctx.proto, ctx.slot_exprs, stmts, inst.a, expr, real_idx);
+        }
+        Opcode::Tgetv => {
+            // TGETV A B C — `R[A] = R[B][R[C]]`. Both B and C are
+            // table/key registers.
+            let obj = lookup_operand(ctx.slot_exprs, inst.b())?;
+            let key = lookup_operand(ctx.slot_exprs, inst.c)?;
+            let expr = Expr::Index {
+                obj: Box::new(obj),
+                key: Box::new(key),
+            };
+            assign_slot_ast(ctx.proto, ctx.slot_exprs, stmts, inst.a, expr, real_idx);
+        }
+        Opcode::Tgetb => {
+            // TGETB A B C — `R[A] = R[B][C]`. C is an inline integer
+            // literal key (NOT a register).
+            let obj = lookup_operand(ctx.slot_exprs, inst.b())?;
+            let expr = Expr::Index {
+                obj: Box::new(obj),
+                key: Box::new(Expr::Int(inst.c as i32)),
+            };
+            assign_slot_ast(ctx.proto, ctx.slot_exprs, stmts, inst.a, expr, real_idx);
         }
         _ => return Err(DecompilerError::NotImplemented),
     }
     Ok(())
+}
+
+/// Read a slot's [`Expr`] without removing it. Used by method-call
+/// detection to inspect the self register without consuming it —
+/// `lookup_operand` would also work but the missing-slot case here
+/// is a `false` (not a method call) rather than an `Err`.
+fn slot_exprs_get(slot_exprs: &HashMap<u8, Expr>, slot: u8) -> Option<&Expr> {
+    slot_exprs.get(&slot)
 }
 
 /// Resolve a register operand to its recorded [`Expr`]. A missing
@@ -1538,6 +1705,10 @@ mod tests {
 
     /// Build a minimal Module whose main proto has the given real
     /// instructions, debug var_info records, and constant tables.
+    ///
+    /// The header flags include `FLAG_FR2` so [`crate::emit::emit_module`]
+    /// threads FR2 through [`recover`] — the test bytecode mirrors
+    /// system-luajit output (CALL args at A+2, with the gap at A+1).
     fn module_with(
         real_insts: Vec<Instruction>,
         var_info: Vec<VarInfo>,
@@ -1545,11 +1716,12 @@ mod tests {
         num_consts: Vec<NumConst>,
         framesize: u8,
     ) -> Module {
+        use crate::ir::FLAG_FR2;
         let mut insts = vec![Instruction::synthetic_header(Opcode::Funcv, framesize)];
         insts.extend(real_insts);
         Module {
             header: ModuleHeader {
-                flags: 0,
+                flags: FLAG_FR2,
                 chunkname: None,
             },
             protos: vec![Proto {
@@ -2371,7 +2543,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg).expect("recover should succeed");
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
 
         assert_eq!(ast.len(), 1, "expected just [If] (implicit RET0 → no Stmt)");
         match &ast[0] {
@@ -2535,7 +2707,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg).expect("recover should succeed");
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
 
         assert_eq!(ast.len(), 1, "expected just [If] (implicit RET0 → no Stmt)");
         match &ast[0] {
@@ -3171,7 +3343,7 @@ mod tests {
         let module = and_chain_module();
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg).expect("recover should succeed");
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [If]");
         match &ast[0] {
             Stmt::If {
@@ -3205,7 +3377,7 @@ mod tests {
         let module = or_chain_module();
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg).expect("recover should succeed");
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [If]");
         match &ast[0] {
             Stmt::If {
@@ -3518,7 +3690,7 @@ mod tests {
         let module = for_loop_module(standard_for_loop_var_info());
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg).expect("recover should succeed");
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
 
         assert_eq!(ast.len(), 1, "expected just [For] (implicit RET0)");
         match &ast[0] {
@@ -3560,7 +3732,7 @@ mod tests {
         // AST: step is Some(Int(2)).
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg).expect("recover should succeed");
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
         match &ast[0] {
             Stmt::For { step, .. } => {
                 assert_eq!(*step, Some(Expr::Int(2)), "step should be Int(2)");
@@ -3650,7 +3822,7 @@ mod tests {
             }],
             entry: BlockId(0),
         };
-        let result = recover(&proto, &cfg);
+        let result = recover(&proto, &cfg, true);
         assert!(
             matches!(result, Err(DecompilerError::NotImplemented)),
             "expected NotImplemented on synthetic self-referential LoopInit, got {:?}",
@@ -3785,7 +3957,7 @@ mod tests {
         let module = while_loop_module(10, true);
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg).expect("recover should succeed");
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
 
         assert_eq!(ast.len(), 3, "expected [LocalDecl, While, Return]");
         match &ast[0] {
@@ -3888,7 +4060,7 @@ mod tests {
         let module = repeat_loop_module(3);
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg).expect("recover should succeed");
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
 
         assert_eq!(ast.len(), 3, "expected [LocalDecl, Repeat, Return]");
         match &ast[0] {
@@ -3965,7 +4137,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg).expect("recover should succeed");
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [If]");
         assert!(
             matches!(ast[0], Stmt::If { .. }),
@@ -4004,7 +4176,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg).expect("recover should succeed");
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [If]");
         assert!(
             matches!(ast[0], Stmt::If { .. }),
@@ -4129,7 +4301,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(proto, &cfg).expect("recover should succeed");
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
         assert_eq!(
             ast.len(),
             1,
@@ -4406,6 +4578,503 @@ mod tests {
         assert!(
             matches!(result, Err(DecompilerError::NotImplemented)),
             "expected NotImplemented for CALL with no function in base slot, got {:?}",
+            result
+        );
+    }
+
+    // ====================================================================
+    // Stage 13: field access / table index / method-call recovery
+    // ====================================================================
+    //
+    // The integration tests in `tests/stage13_fields_and_methods.rs`
+    // cover the end-to-end pipeline (parse → CFG → recover → emit)
+    // using real `luajit -b -g` fixtures. The unit tests below
+    // isolate the TGETS/TGETV/TGETB handling in [`process_inst`], the
+    // method-call detection on the CALL handler, and the FR1/FR2
+    // argument-base fix.
+
+    /// `local x = obj.field` — TGETS with a named destination. The
+    /// Field expression is routed through `assign_slot_ast`, which
+    /// recognizes the slot as a LocalDecl.
+    #[test]
+    fn recover_tgets_field_access() {
+        //   GGET  0 0      (obj — operand 0)
+        //   TGETS 0 0 1    (slot 0 = slot 0[KSTR[reverse(1)]])
+        //   RET0  0 1.
+        // gc_consts file order (reverse-indexed): [field, obj].
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            abc(Opcode::Tgets, 0, 0, 1),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "x", 1, 2)],
+            vec![
+                GcConst::Str(b"field".to_vec()),
+                GcConst::Str(b"obj".to_vec()),
+            ],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "local x = obj.field");
+    }
+
+    /// `local x = obj[5]` — TGETB. C is an inline integer literal
+    /// key, NOT a register.
+    #[test]
+    fn recover_tgetb_numeric_index() {
+        //   GGET   0 0     (obj)
+        //   TGETB  0 0 5   (slot 0 = slot 0[5])
+        //   RET0   0 1.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            abc(Opcode::Tgetb, 0, 0, 5),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "x", 1, 2)],
+            vec![GcConst::Str(b"obj".to_vec())],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "local x = obj[5]");
+    }
+
+    /// `local x = t[k]` — TGETV. Both B (table) and C (key) are
+    /// registers.
+    #[test]
+    fn recover_tgetv_register_index() {
+        //   GGET  0 0     (t)
+        //   GGET  1 1     (k)
+        //   TGETV 0 0 1   (slot 0 = slot 0[slot 1] = t[k])
+        //   RET0  0 1.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Gget, 1, 1),
+            abc(Opcode::Tgetv, 0, 0, 1),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "x", 2, 3)],
+            vec![GcConst::Str(b"k".to_vec()), GcConst::Str(b"t".to_vec())],
+            Vec::new(),
+            2,
+        );
+        assert_eq!(emit(&module), "local x = t[k]");
+    }
+
+    /// TGETS with a non-string GC constant (e.g. an FFI cdata) bails
+    /// with NotImplemented.
+    #[test]
+    fn recover_tgets_non_string_const_not_supported() {
+        // TGETS C=0 → reverse-index 0 → gc_consts[len-1-0]. With
+        // gc_consts = [Str(obj), I64(0)] the operand resolves to
+        // gc_consts[1] = I64 — non-string.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            abc(Opcode::Tgets, 0, 0, 0),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"obj".to_vec()), GcConst::I64(0)],
+            Vec::new(),
+            1,
+        );
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for TGETS with non-string key, got {:?}",
+            result
+        );
+    }
+
+    /// TGETS with an uninitialized table register bails with
+    /// NotImplemented.
+    #[test]
+    fn recover_tgets_uninitialized_table_not_supported() {
+        // slot 0 (the table) is never written.
+        let insts = vec![abc(Opcode::Tgets, 0, 0, 0), ad(Opcode::Ret0, 0, 1)];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"field".to_vec())],
+            Vec::new(),
+            1,
+        );
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for TGETS with uninitialized table, got {:?}",
+            result
+        );
+    }
+
+    /// `obj:method(1)` — method call with one explicit arg. Verified
+    /// against the FR2 disassembly from `luajit -bl`. The recovery
+    /// detects the method-call shape (slot 0 is `Field { obj, name }`,
+    /// self slot 2 holds `obj`) and emits `obj:method(1)`.
+    #[test]
+    fn recover_method_call_with_explicit_arg() {
+        //   GGET   0 0     (obj)
+        //   MOV    2 0     (self = obj → slot 2, the FR2 gap)
+        //   TGETS  0 0 1   (slot 0 = obj.method)
+        //   KSHORT 3 1     (explicit arg → slot 3)
+        //   CALL   0 1 3   (B=1: 0 results; C=3: 2 args)
+        //   RET0   0 1.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Mov, 2, 0),
+            abc(Opcode::Tgets, 0, 0, 1),
+            ad(Opcode::Kshort, 3, 1),
+            abc(Opcode::Call, 0, 1, 3),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![
+                GcConst::Str(b"method".to_vec()),
+                GcConst::Str(b"obj".to_vec()),
+            ],
+            Vec::new(),
+            4,
+        );
+        assert_eq!(emit(&module), "obj:method(1)");
+    }
+
+    /// `obj:method()` — method call with zero explicit args. Same
+    /// shape as `method_call_with_explicit_arg` minus the explicit
+    /// arg load; C=2 means 1 total arg (self), 0 explicit.
+    #[test]
+    fn recover_method_call_no_explicit_args() {
+        //   GGET   0 0     (obj)
+        //   MOV    2 0     (self → slot 2)
+        //   TGETS  0 0 1   (obj.method)
+        //   CALL   0 1 2   (B=1; C=2: 1 arg, 0 explicit)
+        //   RET0   0 1.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Mov, 2, 0),
+            abc(Opcode::Tgets, 0, 0, 1),
+            abc(Opcode::Call, 0, 1, 2),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![
+                GcConst::Str(b"method".to_vec()),
+                GcConst::Str(b"obj".to_vec()),
+            ],
+            Vec::new(),
+            3,
+        );
+        assert_eq!(emit(&module), "obj:method()");
+    }
+
+    /// `local x = obj:method()` — method call with a single result.
+    /// The CALL has B=2 (1 result), routed through `assign_slot_ast`
+    /// so the recovery recognizes slot 0 as a LocalDecl.
+    #[test]
+    fn recover_method_call_result_in_local_decl() {
+        //   GGET   0 0     (obj)
+        //   MOV    2 0     (self → slot 2)
+        //   TGETS  0 0 1   (obj.method)
+        //   CALL   0 2 2   (B=2: 1 result at slot 0; C=2: 1 arg)
+        //   RET0   0 1.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Mov, 2, 0),
+            abc(Opcode::Tgets, 0, 0, 1),
+            abc(Opcode::Call, 0, 2, 2),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "x", 3, 4)],
+            vec![
+                GcConst::Str(b"method".to_vec()),
+                GcConst::Str(b"obj".to_vec()),
+            ],
+            Vec::new(),
+            3,
+        );
+        assert_eq!(emit(&module), "local x = obj:method()");
+    }
+
+    /// If the self slot holds a *different* expr from the Field's
+    /// obj (e.g. a synthetic test bytecode), the recovery falls back
+    /// to a regular function call rather than guessing a method
+    /// call. This exercises the detection predicate's equality
+    /// check.
+    #[test]
+    fn recover_field_call_with_mismatched_self_falls_back() {
+        //   GGET   0 0     (obj)
+        //   GGET   2 2     (something_else → slot 2, would-be self)
+        //   TGETS  0 0 1   (slot 0 = obj.method)
+        //   CALL   0 1 2   (C=2: 1 arg at slot 2)
+        //   RET0   0 1.
+        // slot 2 (the arg) is `something_else`, not `obj`, so the
+        // method-call check fails. The CALL surfaces as a regular
+        // call on the Field expression: `obj.method(something_else)`.
+        // gc_consts file order (reverse-indexed):
+        //   [something_else, method, obj]   (len=3)
+        // so GGET 0 0 → gc_consts[2]=obj, GGET 2 2 → gc_consts[0]=something_else,
+        //    TGETS C=1 → gc_consts[1]=method.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Gget, 2, 2),
+            abc(Opcode::Tgets, 0, 0, 1),
+            abc(Opcode::Call, 0, 1, 2),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![
+                GcConst::Str(b"something_else".to_vec()),
+                GcConst::Str(b"method".to_vec()),
+                GcConst::Str(b"obj".to_vec()),
+            ],
+            Vec::new(),
+            3,
+        );
+        assert_eq!(emit(&module), "obj.method(something_else)");
+    }
+
+    /// Direct AST test for method-call shape: verifies the
+    /// `Stmt::MethodCall` payload (obj, method name, args).
+    #[test]
+    fn recover_method_call_ast_shape() {
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Mov, 2, 0),
+            abc(Opcode::Tgets, 0, 0, 1),
+            ad(Opcode::Kshort, 3, 1),
+            abc(Opcode::Call, 0, 1, 3),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![
+                GcConst::Str(b"method".to_vec()),
+                GcConst::Str(b"obj".to_vec()),
+            ],
+            Vec::new(),
+            4,
+        );
+        let proto = module.main_proto();
+        let cfg = Cfg::build(proto);
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        assert_eq!(
+            ast.len(),
+            1,
+            "expected just [MethodCall] (implicit RET0 → no Stmt)"
+        );
+        match &ast[0] {
+            Stmt::MethodCall { obj, method, args } => {
+                assert_eq!(*obj, Expr::Global("obj".to_string()), "obj");
+                assert_eq!(method, "method", "method");
+                assert_eq!(args.len(), 1, "args len");
+                assert_eq!(args[0], Expr::Int(1), "arg 0");
+            }
+            other => panic!("expected MethodCall, got {:?}", other),
+        }
+    }
+
+    /// Direct AST test for the field-access shape: verifies the
+    /// `Expr::Field` payload is preserved through the slot map.
+    #[test]
+    fn recover_field_access_ast_shape() {
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            abc(Opcode::Tgets, 0, 0, 1),
+            ad(Opcode::Ret1, 0, 2),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![
+                GcConst::Str(b"field".to_vec()),
+                GcConst::Str(b"obj".to_vec()),
+            ],
+            Vec::new(),
+            1,
+        );
+        let proto = module.main_proto();
+        let cfg = Cfg::build(proto);
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        assert_eq!(ast.len(), 1, "expected just [Return]");
+        match &ast[0] {
+            Stmt::Return(Some(expr)) => {
+                assert_eq!(
+                    *expr,
+                    Expr::Field {
+                        obj: Box::new(Expr::Global("obj".to_string())),
+                        name: "field".to_string(),
+                    },
+                    "return expr"
+                );
+            }
+            other => panic!("expected Return(Some(Field)), got {:?}", other),
+        }
+    }
+
+    // ---- FR1/FR2 argument-base fix -----------------------------------
+    //
+    // Stage 13 fixes a latent bug: the CALL handler resolved args
+    // from `A+2` (FR2) unconditionally. FR1 protos (the Darktide
+    // corpus) pack args at `A+1` (no gap). All system-luajit test
+    // fixtures are FR2, so the bug is latent until Stage 14 turns on
+    // corpus support. These unit tests exercise the FR1 path directly
+    // by building a FR1 module and calling `recover` with
+    // `is_fr2 = false`.
+
+    /// Build a Module with FR1 (no FR2 flag). Mirrors `module_with`
+    /// but clears the FR2 flag in the header.
+    fn module_with_fr1(
+        real_insts: Vec<Instruction>,
+        var_info: Vec<VarInfo>,
+        gc_consts: Vec<GcConst>,
+        num_consts: Vec<NumConst>,
+        framesize: u8,
+    ) -> Module {
+        let mut insts = vec![Instruction::synthetic_header(Opcode::Funcv, framesize)];
+        insts.extend(real_insts);
+        Module {
+            header: ModuleHeader {
+                flags: 0,
+                chunkname: None,
+            },
+            protos: vec![Proto {
+                flags: 0,
+                numparams: 0,
+                framesize,
+                upvalues: Vec::<UpvalDesc>::new(),
+                gc_consts,
+                num_consts,
+                insts,
+                debug: Some(DebugInfo {
+                    var_info,
+                    ..DebugInfo::default()
+                }),
+            }],
+        }
+    }
+
+    /// FR1 CALL: args start at A+1 (no gap). The Darktide corpus
+    /// packs args this way; the recovery must honor the FR1 layout.
+    #[test]
+    fn recover_fr1_call_args_at_a_plus_1() {
+        // `f(1)` in FR1:
+        //   GGET   0 0     (f at slot 0)
+        //   KSHORT 1 1     (arg at slot 1, NOT slot 2 — no FR2 gap)
+        //   CALL   0 1 2   (A=0, B=1, C=2: 1 arg at slot A+1)
+        //   RET0   0 1.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Kshort, 1, 1),
+            abc(Opcode::Call, 0, 1, 2),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with_fr1(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            2,
+        );
+        assert_eq!(emit_module(&module).unwrap(), "f(1)");
+    }
+
+    /// FR1 method call: self at slot A+1, explicit args at A+2..A+C.
+    #[test]
+    fn recover_fr1_method_call() {
+        // `obj:method(1)` in FR1:
+        //   GGET   0 0     (obj)
+        //   MOV    1 0     (self = obj → slot A+1 = slot 1)
+        //   TGETS  0 0 1   (obj.method → slot 0)
+        //   KSHORT 2 1     (explicit arg at slot A+2 = slot 2)
+        //   CALL   0 1 3   (C=3: 2 args: self + explicit)
+        //   RET0   0 1.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Mov, 1, 0),
+            abc(Opcode::Tgets, 0, 0, 1),
+            ad(Opcode::Kshort, 2, 1),
+            abc(Opcode::Call, 0, 1, 3),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with_fr1(
+            insts,
+            Vec::new(),
+            vec![
+                GcConst::Str(b"method".to_vec()),
+                GcConst::Str(b"obj".to_vec()),
+            ],
+            Vec::new(),
+            3,
+        );
+        assert_eq!(emit_module(&module).unwrap(), "obj:method(1)");
+    }
+
+    /// Regression: FR2 calls still resolve args from A+2 (the gap).
+    /// Stage 12's behavior must not change.
+    #[test]
+    fn recover_fr2_call_args_at_a_plus_2() {
+        // `f(1)` in FR2 (system-luajit output):
+        //   GGET   0 0     (f at slot 0)
+        //   KSHORT 2 1     (arg at slot 2 — gap at slot 1)
+        //   CALL   0 1 2   (1 arg at slot A+2)
+        //   RET0   0 1.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Kshort, 2, 1),
+            abc(Opcode::Call, 0, 1, 2),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            3,
+        );
+        assert_eq!(emit(&module), "f(1)");
+    }
+
+    /// Table writes (TSETS/TSETV/TSETB) are Stage 14. The recovery
+    /// bails with NotImplemented for each.
+    #[test]
+    fn recover_table_writes_not_supported() {
+        for op in [Opcode::Tsets, Opcode::Tsetv, Opcode::Tsetb] {
+            let insts = vec![abc(op, 0, 0, 0), ad(Opcode::Ret0, 0, 1)];
+            let module = module_with(insts, Vec::new(), Vec::new(), Vec::new(), 1);
+            let result = emit_module(&module);
+            assert!(
+                matches!(result, Err(DecompilerError::NotImplemented)),
+                "expected NotImplemented for {:?}, got {:?}",
+                op,
+                result
+            );
+        }
+    }
+
+    /// TGETR (FFI raw table get — rare) bails with NotImplemented.
+    #[test]
+    fn recover_tgetr_not_supported() {
+        let insts = vec![abc(Opcode::Tgetr, 0, 0, 0), ad(Opcode::Ret0, 0, 1)];
+        let module = module_with(insts, Vec::new(), Vec::new(), Vec::new(), 1);
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for TGETR, got {:?}",
             result
         );
     }
