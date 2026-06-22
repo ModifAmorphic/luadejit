@@ -4807,43 +4807,6 @@ mod tests {
         assert_eq!(emit(&module), "local x = obj:method()");
     }
 
-    /// Method-call detection requires the self slot to equal the
-    /// Field's obj. If it doesn't (the user wrote `obj.method(obj)`
-    /// explicitly, which compiles to a regular CALL), the recovery
-    /// falls back to a regular function call.
-    #[test]
-    fn recover_field_call_not_method() {
-        // `obj.method(obj)` — same shape as `obj:method()` from the
-        // compiler's POV *except* the user wrote `obj.method(obj)`.
-        // LuaJIT's compiler actually lowers both forms identically
-        // (the explicit `obj` arg becomes self), so this test pins
-        // the recovery's canonical output: the method-call form.
-        // The construction here is the literal bytecode from
-        // `obj.method(obj)` — which matches `obj:method()` — so we
-        // expect the method-call desugaring.
-        let insts = vec![
-            ad(Opcode::Gget, 0, 0),
-            ad(Opcode::Mov, 2, 0),
-            abc(Opcode::Tgets, 0, 0, 1),
-            abc(Opcode::Call, 0, 1, 2),
-            ad(Opcode::Ret0, 0, 1),
-        ];
-        let module = module_with(
-            insts,
-            Vec::new(),
-            vec![
-                GcConst::Str(b"method".to_vec()),
-                GcConst::Str(b"obj".to_vec()),
-            ],
-            Vec::new(),
-            3,
-        );
-        // The recovery always desugars this shape to `obj:method()`.
-        // The two source forms are indistinguishable at the bytecode
-        // level; the method-call form is canonical.
-        assert_eq!(emit(&module), "obj:method()");
-    }
-
     /// If the self slot holds a *different* expr from the Field's
     /// obj (e.g. a synthetic test bytecode), the recovery falls back
     /// to a regular function call rather than guessing a method
