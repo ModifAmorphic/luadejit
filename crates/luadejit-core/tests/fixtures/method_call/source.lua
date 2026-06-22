@@ -1,0 +1,1 @@
+obj:method(1)

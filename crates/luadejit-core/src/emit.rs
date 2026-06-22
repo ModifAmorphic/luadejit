@@ -14,8 +14,9 @@
 //! old walk-based emitter; the new capabilities are `if/then` (Stage
 //! 7), `if/else` (Stage 8), compound `and`/`or` conditions (Stage 9),
 //! numeric-`for` loops (Stage 10), `while`/`repeat` loops (Stage 11),
-//! and regular function calls (Stage 12). Any CFG shape the recovery
-//! doesn't model surfaces as [`DecompilerError::NotImplemented`].
+//! regular function calls (Stage 12), and field access + method
+//! calls (Stage 13). Any CFG shape the recovery doesn't model
+//! surfaces as [`DecompilerError::NotImplemented`].
 //!
 //! ## Formatting invariants
 //!
@@ -49,7 +50,8 @@ const INDENT_SPACES: usize = 4;
 pub fn emit_module(module: &Module) -> Result<String, DecompilerError> {
     let main = module.main_proto();
     let cfg = Cfg::build(main);
-    let ast = recover(main, &cfg)?;
+    let is_fr2 = module.header.is_fr2();
+    let ast = recover(main, &cfg, is_fr2)?;
     Ok(emit_ast(&ast))
 }
 
@@ -80,6 +82,9 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> Option<String> {
         Stmt::Return(Some(expr)) => Some(format!("{}return {}", pad, format_expr(expr))),
         Stmt::Return(None) => None,
         Stmt::Call { func, args } => Some(format!("{}{}", pad, format_call(func, args))),
+        Stmt::MethodCall { obj, method, args } => {
+            Some(format!("{}{}", pad, format_method_call(obj, method, args)))
+        }
         Stmt::If {
             cond,
             then_body,
@@ -228,6 +233,9 @@ fn format_expr(expr: &Expr) -> String {
             format!("{} or {}", format_expr(left), format_expr(right))
         }
         Expr::Call { func, args } => format_call(func, args),
+        Expr::Field { obj, name } => format!("{}.{}", format_expr(obj), name),
+        Expr::Index { obj, key } => format!("{}[{}]", format_expr(obj), format_expr(key)),
+        Expr::MethodCall { obj, method, args } => format_method_call(obj, method, args),
     }
 }
 
@@ -245,6 +253,20 @@ fn format_expr(expr: &Expr) -> String {
 fn format_call(func: &Expr, args: &[Expr]) -> String {
     let args_str = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
     format!("{}({})", format_expr(func), args_str)
+}
+
+/// Format a method call's `obj:method(args...)` portion (without
+/// leading indentation). Shared between [`Stmt::MethodCall`] (a
+/// bare call statement) and [`Expr::MethodCall`] (a method call
+/// nested inside another expression).
+///
+/// Like [`format_call`], no parenthesization of `obj` — Stage 13
+/// fixtures use atomic receivers (globals / locals). Future stages
+/// that allow non-atomic receivers (e.g. `(a or b):method()`) will
+/// need precedence-aware parenthesization.
+fn format_method_call(obj: &Expr, method: &str, args: &[Expr]) -> String {
+    let args_str = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+    format!("{}:{}({})", format_expr(obj), method, args_str)
 }
 
 /// Map a [`BinOpKind`] to its Lua source operator.
@@ -488,6 +510,131 @@ mod tests {
             args: vec![Expr::Int(1)],
         }));
         assert_eq!(format_stmt(&stmt, 0).unwrap(), "return f(1)");
+    }
+
+    // ---- Stage 13: field-access / index / method-call formatting -----
+
+    #[test]
+    fn formats_field_access() {
+        // `obj.field` — Field expr.
+        let expr = Expr::Field {
+            obj: Box::new(Expr::Global("obj".to_string())),
+            name: "field".to_string(),
+        };
+        assert_eq!(format_expr(&expr), "obj.field");
+    }
+
+    #[test]
+    fn formats_field_access_on_var() {
+        // `x.field` — Field on a local variable.
+        let expr = Expr::Field {
+            obj: Box::new(Expr::Var("x".to_string())),
+            name: "field".to_string(),
+        };
+        assert_eq!(format_expr(&expr), "x.field");
+    }
+
+    #[test]
+    fn formats_index_with_int_key() {
+        // `obj[5]` — Index with integer key.
+        let expr = Expr::Index {
+            obj: Box::new(Expr::Global("obj".to_string())),
+            key: Box::new(Expr::Int(5)),
+        };
+        assert_eq!(format_expr(&expr), "obj[5]");
+    }
+
+    #[test]
+    fn formats_index_with_var_key() {
+        // `t[k]` — Index with variable key.
+        let expr = Expr::Index {
+            obj: Box::new(Expr::Var("t".to_string())),
+            key: Box::new(Expr::Var("k".to_string())),
+        };
+        assert_eq!(format_expr(&expr), "t[k]");
+    }
+
+    #[test]
+    fn formats_method_call_no_args() {
+        // `obj:method()` — method call with empty arg list.
+        let expr = Expr::MethodCall {
+            obj: Box::new(Expr::Global("obj".to_string())),
+            method: "method".to_string(),
+            args: vec![],
+        };
+        assert_eq!(format_expr(&expr), "obj:method()");
+    }
+
+    #[test]
+    fn formats_method_call_with_args() {
+        // `obj:method(1, "x")` — method call with mixed-type args.
+        let expr = Expr::MethodCall {
+            obj: Box::new(Expr::Global("obj".to_string())),
+            method: "method".to_string(),
+            args: vec![Expr::Int(1), Expr::Str(b"x".to_vec())],
+        };
+        assert_eq!(format_expr(&expr), "obj:method(1, \"x\")");
+    }
+
+    #[test]
+    fn formats_method_call_statement_at_zero_indent() {
+        // `obj:method(1)` — bare method call at top level.
+        let stmt = Stmt::MethodCall {
+            obj: Expr::Global("obj".to_string()),
+            method: "method".to_string(),
+            args: vec![Expr::Int(1)],
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "obj:method(1)");
+    }
+
+    #[test]
+    fn formats_method_call_statement_at_nonzero_indent() {
+        // Bare method call inside an indented block.
+        let stmt = Stmt::MethodCall {
+            obj: Expr::Var("self".to_string()),
+            method: "update".to_string(),
+            args: vec![Expr::Float(1.5)],
+        };
+        assert_eq!(format_stmt(&stmt, 1).unwrap(), "    self:update(1.5)");
+    }
+
+    #[test]
+    fn formats_local_decl_with_method_call_rhs() {
+        // `local x = obj:method()` — MethodCall as RHS of LocalDecl.
+        let stmt = Stmt::LocalDecl {
+            name: "x".to_string(),
+            expr: Expr::MethodCall {
+                obj: Box::new(Expr::Global("obj".to_string())),
+                method: "method".to_string(),
+                args: vec![],
+            },
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "local x = obj:method()");
+    }
+
+    #[test]
+    fn formats_return_with_method_call_expr() {
+        // `return obj:method()` — MethodCall as returned expr.
+        let stmt = Stmt::Return(Some(Expr::MethodCall {
+            obj: Box::new(Expr::Global("obj".to_string())),
+            method: "method".to_string(),
+            args: vec![Expr::Int(1)],
+        }));
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "return obj:method(1)");
+    }
+
+    #[test]
+    fn formats_nested_field_access_no_parens() {
+        // `a.b.c` — chained Field access (Stage 13 doesn't yet
+        // recover this, but the formatter handles the AST shape).
+        let expr = Expr::Field {
+            obj: Box::new(Expr::Field {
+                obj: Box::new(Expr::Global("a".to_string())),
+                name: "b".to_string(),
+            }),
+            name: "c".to_string(),
+        };
+        assert_eq!(format_expr(&expr), "a.b.c");
     }
 
     #[test]
