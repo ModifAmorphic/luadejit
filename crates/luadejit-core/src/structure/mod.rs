@@ -45,6 +45,18 @@
 //! fixes the FR1/FR2 argument-base bug — the CALL handler now honors
 //! the proto's frame convention instead of assuming FR2.
 //!
+//! **Stage 14** adds table construction and table writes: `{}`, `{1,
+//! 2, 3}`, `{a = 1}`, and `t.x = 1` / `t[0] = 1`. TNEW lowers
+//! directly to `Expr::Table { entries: vec![] }`; TDUP reads the
+//! pre-built template from `gc_consts` and lowers to a populated
+//! `Expr::Table`. The TSET* family lowers to `Stmt::TableSet`,
+//! which emits `target = value` where `target` is an `Expr::Field`
+//! (TSETS — string key) or `Expr::Index` (TSETB — literal int key,
+//! or TSETV — register key). The operand order is reversed from
+//! TGET*: TSET* has A = value, B = table, C = key, whereas TGET*
+//! has A = destination, B = table, C = key. TSETM (multres table
+//! population for `{f()}`) is deferred to Stage 15.
+//!
 //! **Stage 11** adds `while cond do … end` and `repeat … until cond`
 //! support. Both are detected at the [`ConditionalBranch`] arm of
 //! [`recover_from`]:
@@ -90,7 +102,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::cfg::{BlockId, Cfg, InstructionId, Terminator};
-use crate::ir::{GcConst, Instruction, NumConst, Opcode, Proto};
+use crate::ir::{GcConst, Instruction, KtabK, NumConst, Opcode, Proto, TableConst};
 use crate::DecompilerError;
 
 // ---- AST types -------------------------------------------------------
@@ -149,6 +161,15 @@ pub enum Stmt {
         method: String,
         args: Vec<Expr>,
     },
+    /// A table-field or table-index assignment (Stage 14):
+    /// `t.x = value` or `t[k] = value`. The `target` is the location
+    /// being assigned — an [`Expr::Field`] (lowered from TSETS) or
+    /// [`Expr::Index`] (lowered from TSETB/TSETV). Stage 14 does not
+    /// merge `TNEW` + subsequent `TSET*` into a single literal — the
+    /// table is created in one statement and the entries are filled
+    /// in by separate `TableSet` statements, matching the bytecode
+    /// shape LuaJIT emits for `local t = {}; t.x = 1`.
+    TableSet { target: Expr, value: Expr },
 }
 
 /// A Lua expression. Stage 7's variants cover the values Stages 1-6
@@ -240,6 +261,29 @@ pub enum Expr {
         method: String,
         args: Vec<Expr>,
     },
+    /// A table literal (Stage 14). Lowered from `TNEW` (empty table)
+    /// or `TDUP` (template-table duplication — populated table). The
+    /// entries are kept in source order: array entries first, then
+    /// hash entries in the order TDUP's template records them.
+    Table {
+        entries: Vec<TableEntry>,
+    },
+}
+
+/// A table entry in a table literal (Stage 14).
+#[derive(Clone, Debug, PartialEq)]
+pub enum TableEntry {
+    /// Positional array entry: `val` (key is the next sequential
+    /// integer, starting at 1).
+    Array(Expr),
+    /// String-keyed hash entry: `key = val`. The key is a bare
+    /// identifier (no quoting) when emitted — Lua syntax for
+    /// `{name = value}`.
+    HashStr(String, Expr),
+    /// Expression-keyed hash entry: `[key] = val`. Used when the
+    /// TDUP template's key isn't a string (e.g. `Int(1)`), where the
+    /// Lua source would need `[1] = value` syntax.
+    HashExpr(Expr, Expr),
 }
 
 /// The binary operator kind attached to [`Expr::BinOp`]. Stage 7
@@ -288,7 +332,9 @@ pub enum BinOpKind {
 /// non-multres, non-method) function calls. **Stage 13** adds
 /// field access (`obj.field`, `obj[k]`) and method-call detection
 /// (`obj:method(args)`), and threads `is_fr2` through so the CALL
-/// handler honors the proto's frame convention.
+/// handler honors the proto's frame convention. **Stage 14** adds
+/// table literals (`{}`, `{1, 2}`, `{a = 1}`) and table writes
+/// (`t.x = 1`, `t[0] = 1`).
 ///
 /// Unreachable blocks (e.g. the dead "skip-else" JMP LuaJIT emits
 /// after a returning then-body) are *not* rejected wholesale — they
@@ -1281,6 +1327,88 @@ fn process_inst(
             };
             assign_slot_ast(ctx.proto, ctx.slot_exprs, stmts, inst.a, expr, real_idx);
         }
+        Opcode::Tnew => {
+            // TNEW A D — create an empty table at slot A. D is an
+            // array-size hint (asynchronously allocated); ignore it
+            // for decompilation — emit `{}`.
+            let table_expr = Expr::Table { entries: vec![] };
+            assign_slot_ast(
+                ctx.proto,
+                ctx.slot_exprs,
+                stmts,
+                inst.a,
+                table_expr,
+                real_idx,
+            );
+        }
+        Opcode::Tdup => {
+            // TDUP A D — copy the template table at
+            // gc_consts[reverse(D)] into slot A. The template is a
+            // pre-built GC constant (`GcConst::Tab`) carrying the
+            // array part and the hash part; rebuild each entry as a
+            // [`TableEntry`] for the AST.
+            let gc = ctx.proto.gc_const_for_operand(inst.d())?;
+            let table_const = match gc {
+                GcConst::Tab(t) => t,
+                _ => return Err(DecompilerError::NotImplemented),
+            };
+            let entries = table_const_to_entries(table_const);
+            let table_expr = Expr::Table { entries };
+            assign_slot_ast(
+                ctx.proto,
+                ctx.slot_exprs,
+                stmts,
+                inst.a,
+                table_expr,
+                real_idx,
+            );
+        }
+        Opcode::Tsets => {
+            // TSETS A B C — `R[B][KSTR[reverse(C)]] = R[A]`. Note the
+            // operand order: A = value, B = table, C = key. This is
+            // REVERSED from TGETS (where A = destination).
+            let value = lookup_operand(ctx.slot_exprs, inst.a)?;
+            let table = lookup_operand(ctx.slot_exprs, inst.b())?;
+            let gc = ctx.proto.gc_const_for_operand(inst.c as u16)?;
+            let name = match gc {
+                GcConst::Str(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                _ => return Err(DecompilerError::NotImplemented),
+            };
+            stmts.push(Stmt::TableSet {
+                target: Expr::Field {
+                    obj: Box::new(table),
+                    name,
+                },
+                value,
+            });
+        }
+        Opcode::Tsetb => {
+            // TSETB A B C — `R[B][C] = R[A]`. C is an inline integer
+            // literal key (NOT a register). A = value, B = table.
+            let value = lookup_operand(ctx.slot_exprs, inst.a)?;
+            let table = lookup_operand(ctx.slot_exprs, inst.b())?;
+            stmts.push(Stmt::TableSet {
+                target: Expr::Index {
+                    obj: Box::new(table),
+                    key: Box::new(Expr::Int(inst.c as i32)),
+                },
+                value,
+            });
+        }
+        Opcode::Tsetv => {
+            // TSETV A B C — `R[B][R[C]] = R[A]`. Both B and C are
+            // registers (table and key). A = value.
+            let value = lookup_operand(ctx.slot_exprs, inst.a)?;
+            let table = lookup_operand(ctx.slot_exprs, inst.b())?;
+            let key = lookup_operand(ctx.slot_exprs, inst.c)?;
+            stmts.push(Stmt::TableSet {
+                target: Expr::Index {
+                    obj: Box::new(table),
+                    key: Box::new(key),
+                },
+                value,
+            });
+        }
         _ => return Err(DecompilerError::NotImplemented),
     }
     Ok(())
@@ -1385,6 +1513,135 @@ fn build_const_expr(proto: &Proto, load: &Instruction) -> Result<Expr, Decompile
             _ => Err(DecompilerError::NotImplemented),
         },
         _ => Err(DecompilerError::NotImplemented),
+    }
+}
+
+/// Convert a template-table key/value ([`KtabK`]) to its source
+/// [`Expr`] form. Used by [`table_const_to_entries`] when rebuilding
+/// a TDUP template as a [`Expr::Table`] literal (Stage 14).
+///
+/// `KtabK::Int` is stored as a `u64` in the format but represents a
+/// table key/value; for the AST we cast to `i32` (matching
+/// [`Expr::Int`]). Lua table keys can be larger than `i32` in
+/// principle, but the fixtures and corpus LuaJIT emits for the
+/// common cases stay within `i32` range. Out-of-range values wrap
+/// silently — same behavior as the existing `TGETB` literal-key
+/// handling.
+fn ktabk_to_expr(k: &KtabK) -> Expr {
+    match k {
+        KtabK::Nil => Expr::Nil,
+        KtabK::False => Expr::False,
+        KtabK::True => Expr::True,
+        KtabK::Int(n) => Expr::Int(*n as i32),
+        KtabK::Num(f) => Expr::Float(*f),
+        KtabK::Str(bytes) => Expr::Str(bytes.clone()),
+    }
+}
+
+/// Rebuild a [`TableConst`] (the pre-built template TDUP copies) as
+/// a list of [`TableEntry`] in source-approximation order.
+///
+/// ## Array part — skip the index-0 Nil sentinel
+///
+/// LuaJIT stores the array part with a leading `Nil` at index 0
+/// (Lua's array indexing is 1-based, so slot 0 in the C-level
+/// `TValue` array is an unused sentinel). The template records the
+/// array as-is, so a literal like `{1, 2, 3}` round-trips through
+/// the bytecode as `[Nil, Int(1), Int(2), Int(3)]`. The recovery
+/// skips the leading `Nil` so the output renders as `{1, 2, 3}`.
+///
+/// Defensive: only skip the leading entry when it actually *is*
+/// `KtabK::Nil`. A template with no leading Nil (which shouldn't
+/// happen in valid LuaJIT output, but could in synthetic bytecode)
+/// is passed through verbatim.
+///
+/// ## Hash part — alphabetical canonicalization
+///
+/// LuaJIT stores hash entries in the template in their internal
+/// hash-table bucket order, which depends on the hash function and
+/// is **not** the source order. Empirically:
+///
+/// - `{a=1, b=2}`           → template `[(b, 2), (a, 1)]`
+/// - `{a=1, b=2, c=3}`      → template `[(a, 1), (b, 2), (c, 3)]`
+/// - `{x=1, a=2, m=3, …}`   → template `[(z,4), (a,2), (m,3), …]`
+///
+/// The original source order is **unrecoverable** from the bytecode
+/// alone. Stage 14 canonicalizes hash entries by sorting
+/// alphabetically by key (string keys by string content; non-string
+/// keys after string keys, ordered by their formatted Lua source).
+/// This produces deterministic output that matches source order
+/// whenever the user wrote keys in alphabetical order (the common
+/// idiomatic case). Source code with non-alphabetical hash order
+/// round-trips to a semantically equivalent but reordered literal
+/// — a known limitation.
+fn table_const_to_entries(table: &TableConst) -> Vec<TableEntry> {
+    let mut entries = Vec::with_capacity(table.array.len() + table.hash.len());
+
+    // Array part: skip the leading Nil sentinel if present.
+    for elem in skip_leading_nil_sentinel(&table.array) {
+        entries.push(TableEntry::Array(ktabk_to_expr(elem)));
+    }
+
+    // Hash part: split into string-keyed and non-string-keyed,
+    // sort each group, and emit string-keyed entries first (the
+    // common case).
+    let mut str_entries: Vec<(String, Expr)> = Vec::new();
+    let mut other_entries: Vec<(Expr, Expr)> = Vec::new();
+    for (key, val) in &table.hash {
+        match key {
+            KtabK::Str(bytes) => {
+                let name = String::from_utf8_lossy(bytes).into_owned();
+                str_entries.push((name, ktabk_to_expr(val)));
+            }
+            _ => {
+                other_entries.push((ktabk_to_expr(key), ktabk_to_expr(val)));
+            }
+        }
+    }
+    // Alphabetical sort by key (stable; preserves order of equal
+    // keys, though duplicate string keys can't exist in a valid
+    // template).
+    str_entries.sort_by_key(|(name, _)| name.clone());
+    for (name, val) in str_entries {
+        entries.push(TableEntry::HashStr(name, val));
+    }
+    // Non-string keys: sort by a stable string form so the output
+    // is deterministic. (Int keys zero-pad to keep numerical order
+    // — without padding, "10" would sort before "2".)
+    other_entries.sort_by_key(|(a, _)| format_key_for_sort(a));
+    for (key, val) in other_entries {
+        entries.push(TableEntry::HashExpr(key, val));
+    }
+    entries
+}
+
+/// Return the array slice with the leading `Nil` sentinel dropped,
+/// if present. LuaJIT always stores a `Nil` at array index 0 (the
+/// C-level slot Lua's 1-based indexing skips); the decompiler
+/// drops it so a literal like `{1, 2, 3}` round-trips cleanly.
+fn skip_leading_nil_sentinel(array: &[KtabK]) -> &[KtabK] {
+    if let Some(first) = array.first() {
+        if matches!(first, KtabK::Nil) {
+            return &array[1..];
+        }
+    }
+    array
+}
+
+/// Format a non-string table key for deterministic sorting in
+/// [`table_const_to_entries`]. Integer keys zero-pad to keep
+/// numerical order (`"0000000002"` < `"0000000010"`); floats and
+/// other types fall back to debug formatting. Used only for sort
+/// stability — the rendered output goes through [`crate::emit`].
+fn format_key_for_sort(expr: &Expr) -> String {
+    match expr {
+        Expr::Int(n) => format!("{:020}", n),
+        Expr::Float(f) => format!("{:020.6}", f),
+        Expr::Str(bytes) => format!("{:?}", bytes),
+        Expr::Nil => "nil".to_string(),
+        Expr::True => "true".to_string(),
+        Expr::False => "false".to_string(),
+        _ => format!("{:?}", expr),
     }
 }
 
@@ -1684,8 +1941,8 @@ mod tests {
     use crate::cfg::{BasicBlock, Cfg};
     use crate::emit::emit_module;
     use crate::ir::{
-        DebugInfo, GcConst, Instruction, Module, ModuleHeader, NumConst, Opcode, Proto, UpvalDesc,
-        VarInfo, VarKind,
+        DebugInfo, GcConst, Instruction, KtabK, Module, ModuleHeader, NumConst, Opcode, Proto,
+        TableConst, UpvalDesc, VarInfo, VarKind,
     };
 
     // ---- shared test builders ------------------------------------------
@@ -5049,21 +5306,20 @@ mod tests {
         assert_eq!(emit(&module), "f(1)");
     }
 
-    /// Table writes (TSETS/TSETV/TSETB) are Stage 14. The recovery
-    /// bails with NotImplemented for each.
+    /// TSETM (multres table set, used for `{f()}`) is Stage 15. The
+    /// recovery bails with NotImplemented. (Stage 14 added
+    /// TSETS/TSETV/TSETB handlers — those are covered by the
+    /// `recover_tset*` tests below.)
     #[test]
-    fn recover_table_writes_not_supported() {
-        for op in [Opcode::Tsets, Opcode::Tsetv, Opcode::Tsetb] {
-            let insts = vec![abc(op, 0, 0, 0), ad(Opcode::Ret0, 0, 1)];
-            let module = module_with(insts, Vec::new(), Vec::new(), Vec::new(), 1);
-            let result = emit_module(&module);
-            assert!(
-                matches!(result, Err(DecompilerError::NotImplemented)),
-                "expected NotImplemented for {:?}, got {:?}",
-                op,
-                result
-            );
-        }
+    fn recover_tsetm_not_supported() {
+        let insts = vec![ad(Opcode::Tsetm, 0, 0), ad(Opcode::Ret0, 0, 1)];
+        let module = module_with(insts, Vec::new(), Vec::new(), Vec::new(), 1);
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for TSETM, got {:?}",
+            result
+        );
     }
 
     /// TGETR (FFI raw table get — rare) bails with NotImplemented.
@@ -5077,5 +5333,477 @@ mod tests {
             "expected NotImplemented for TGETR, got {:?}",
             result
         );
+    }
+
+    // ====================================================================
+    // Stage 14: table construction (TNEW/TDUP) and table writes
+    // (TSETS/TSETB/TSETV)
+    // ====================================================================
+    //
+    // The integration tests in `tests/stage14_tables.rs` cover the
+    // end-to-end pipeline (parse → CFG → recover → emit) using real
+    // `luajit -b -g` fixtures. The unit tests below isolate the
+    // individual opcode handlers in [`process_inst`], the
+    // template-table → AST conversion, and the
+    // operand-order reversal of TSET* vs TGET*.
+
+    /// Build a [`TableConst`] from its array and hash parts. Used by
+    /// the TDUP unit tests.
+    fn table_const(array: Vec<KtabK>, hash: Vec<(KtabK, KtabK)>) -> TableConst {
+        TableConst { array, hash }
+    }
+
+    /// `local t = {}` — TNEW with no debug name hint. Emits an empty
+    /// `Expr::Table` literal. D is the array-size hint; the recovery
+    /// ignores it.
+    #[test]
+    fn recover_tnew_empty_table() {
+        //   TNEW  0 0     (empty table → slot 0; D = array-size hint)
+        //   RET0  0 1.
+        let insts = vec![ad(Opcode::Tnew, 0, 0), ad(Opcode::Ret0, 0, 1)];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "t", 0, 1)],
+            Vec::new(),
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "local t = {}");
+    }
+
+    /// `local t = {1, 2, 3}` — TDUP with an array-only template. The
+    /// template's array entries rebuild as positional
+    /// [`TableEntry::Array`] in source order.
+    #[test]
+    fn recover_tdup_array_only() {
+        //   TDUP  0 0     (template at gc_consts[reverse(0)] → slot 0)
+        //   RET0  0 1.
+        let insts = vec![ad(Opcode::Tdup, 0, 0), ad(Opcode::Ret0, 0, 1)];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "t", 0, 1)],
+            vec![GcConst::Tab(table_const(
+                vec![KtabK::Int(1), KtabK::Int(2), KtabK::Int(3)],
+                Vec::new(),
+            ))],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "local t = {1, 2, 3}");
+    }
+
+    /// `local t = {a = 1, b = 2}` — TDUP with a hash-only template.
+    /// Each string key becomes a [`TableEntry::HashStr`] rendering as
+    /// `key = value`.
+    #[test]
+    fn recover_tdup_hash_only() {
+        let insts = vec![ad(Opcode::Tdup, 0, 0), ad(Opcode::Ret0, 0, 1)];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "t", 0, 1)],
+            vec![GcConst::Tab(table_const(
+                Vec::new(),
+                vec![
+                    (KtabK::Str(b"a".to_vec()), KtabK::Int(1)),
+                    (KtabK::Str(b"b".to_vec()), KtabK::Int(2)),
+                ],
+            ))],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "local t = {a = 1, b = 2}");
+    }
+
+    /// `local t = {1, 2, x = 3}` — TDUP with both array and hash
+    /// parts. Array entries precede hash entries in the template
+    /// (LuaJIT always emits array-first regardless of source order).
+    #[test]
+    fn recover_tdup_mixed() {
+        let insts = vec![ad(Opcode::Tdup, 0, 0), ad(Opcode::Ret0, 0, 1)];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "t", 0, 1)],
+            vec![GcConst::Tab(table_const(
+                vec![KtabK::Int(1), KtabK::Int(2)],
+                vec![(KtabK::Str(b"x".to_vec()), KtabK::Int(3))],
+            ))],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "local t = {1, 2, x = 3}");
+    }
+
+    /// TDUP template with non-string keys renders as `[key] = value`
+    /// (Lua syntax for arbitrary hash keys). This is uncommon in
+    /// practice — LuaJIT only emits a TDUP for constant keys — but
+    /// the recovery handles it.
+    #[test]
+    fn recover_tdup_int_key_renders_with_brackets() {
+        let insts = vec![ad(Opcode::Tdup, 0, 0), ad(Opcode::Ret0, 0, 1)];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "t", 0, 1)],
+            vec![GcConst::Tab(table_const(
+                Vec::new(),
+                vec![(KtabK::Int(1), KtabK::Str(b"v".to_vec()))],
+            ))],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "local t = {[1] = \"v\"}");
+    }
+
+    /// LuaJIT stores the array part with a leading `Nil` sentinel at
+    /// index 0 (Lua's array indexing is 1-based). The recovery drops
+    /// it — without this skip, `{1, 2, 3}` would round-trip as
+    /// `{nil, 1, 2, 3}` (matching the raw template).
+    #[test]
+    fn recover_tdup_array_skips_leading_nil_sentinel() {
+        let insts = vec![ad(Opcode::Tdup, 0, 0), ad(Opcode::Ret0, 0, 1)];
+        // Simulate LuaJIT's actual template for `{1, 2, 3}`:
+        // array = [Nil, 1, 2, 3] (sentinel + values).
+        let module = module_with(
+            insts,
+            vec![named_local(0, "t", 0, 1)],
+            vec![GcConst::Tab(table_const(
+                vec![KtabK::Nil, KtabK::Int(1), KtabK::Int(2), KtabK::Int(3)],
+                Vec::new(),
+            ))],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "local t = {1, 2, 3}");
+    }
+
+    /// A template array with no leading Nil (synthetic bytecode)
+    /// passes through verbatim — the recovery is defensive about
+    /// the sentinel.
+    #[test]
+    fn recover_tdup_array_no_sentinel_passes_through() {
+        let insts = vec![ad(Opcode::Tdup, 0, 0), ad(Opcode::Ret0, 0, 1)];
+        // Synthetic: array = [1, 2] — no leading Nil. LuaJIT never
+        // produces this, but we handle it without panicking.
+        let module = module_with(
+            insts,
+            vec![named_local(0, "t", 0, 1)],
+            vec![GcConst::Tab(table_const(
+                vec![KtabK::Int(1), KtabK::Int(2)],
+                Vec::new(),
+            ))],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "local t = {1, 2}");
+    }
+
+    /// LuaJIT stores hash entries in internal hash-bucket order, not
+    /// source order. The recovery sorts string-keyed entries
+    /// alphabetically so `{a=1, b=2}` round-trips cleanly even when
+    /// the template stores them as `[(b,2), (a,1)]` (which is what
+    /// LuaJIT emits for this source on this version).
+    #[test]
+    fn recover_tdup_hash_canonicalizes_alphabetically() {
+        let insts = vec![ad(Opcode::Tdup, 0, 0), ad(Opcode::Ret0, 0, 1)];
+        // Simulate the template LuaJIT actually emits for
+        // `{a = 1, b = 2}`: hash = [(b, 2), (a, 1)] (reverse source).
+        let module = module_with(
+            insts,
+            vec![named_local(0, "t", 0, 1)],
+            vec![GcConst::Tab(table_const(
+                Vec::new(),
+                vec![
+                    (KtabK::Str(b"b".to_vec()), KtabK::Int(2)),
+                    (KtabK::Str(b"a".to_vec()), KtabK::Int(1)),
+                ],
+            ))],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "local t = {a = 1, b = 2}");
+    }
+
+    /// Hash canonicalization keeps string keys grouped before
+    /// non-string keys. Mixed-key tables are rare but the recovery
+    /// produces deterministic output for them.
+    #[test]
+    fn recover_tdup_hash_mixed_key_types_string_first() {
+        let insts = vec![ad(Opcode::Tdup, 0, 0), ad(Opcode::Ret0, 0, 1)];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "t", 0, 1)],
+            vec![GcConst::Tab(table_const(
+                Vec::new(),
+                vec![
+                    (KtabK::Int(2), KtabK::Str(b"two".to_vec())),
+                    (KtabK::Str(b"b".to_vec()), KtabK::Int(2)),
+                    (KtabK::Int(1), KtabK::Str(b"one".to_vec())),
+                    (KtabK::Str(b"a".to_vec()), KtabK::Int(1)),
+                ],
+            ))],
+            Vec::new(),
+            1,
+        );
+        // Strings alphabetically first, then ints numerically.
+        assert_eq!(
+            emit(&module),
+            "local t = {a = 1, b = 2, [1] = \"one\", [2] = \"two\"}"
+        );
+    }
+
+    /// TDUP template with mixed-typed values (Nil/True/False/Int/Num/Str)
+    /// all rebuild through `ktabk_to_expr`. Spot-check a couple.
+    #[test]
+    fn recover_tdup_mixed_value_types() {
+        let insts = vec![ad(Opcode::Tdup, 0, 0), ad(Opcode::Ret0, 0, 1)];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "t", 0, 1)],
+            vec![GcConst::Tab(table_const(
+                vec![
+                    KtabK::True,
+                    KtabK::Nil,
+                    KtabK::Num(1.5),
+                    KtabK::Str(b"s".to_vec()),
+                ],
+                Vec::new(),
+            ))],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "local t = {true, nil, 1.5, \"s\"}");
+    }
+
+    /// TDUP with a non-table GC constant (e.g. a string) bails with
+    /// NotImplemented. This shouldn't happen in valid bytecode but
+    /// the recovery is defensive.
+    #[test]
+    fn recover_tdup_non_table_const_not_supported() {
+        let insts = vec![ad(Opcode::Tdup, 0, 0), ad(Opcode::Ret0, 0, 1)];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "t", 0, 1)],
+            vec![GcConst::Str(b"oops".to_vec())],
+            Vec::new(),
+            1,
+        );
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for TDUP with non-table GC const, got {:?}",
+            result
+        );
+    }
+
+    /// `local t = {}; t.x = 1` — TSETS into an empty table. A is the
+    /// value register, B is the table register, C is the reverse-indexed
+    /// string-key constant. Note the operand order: TSET* has
+    /// A = value, B = table, C = key — reversed from TGET*.
+    #[test]
+    fn recover_tsets_field_write() {
+        //   TNEW   0 0    (empty table → slot 0)
+        //   KSHORT 1 1    (value 1 → slot 1)
+        //   TSETS  1 0 0  (R[0][KSTR[reverse(0)]] = R[1], i.e. t.x = 1)
+        //   RET0   0 1.
+        let insts = vec![
+            ad(Opcode::Tnew, 0, 0),
+            ad(Opcode::Kshort, 1, 1),
+            abc(Opcode::Tsets, 1, 0, 0),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "t", 0, 3)],
+            vec![GcConst::Str(b"x".to_vec())],
+            Vec::new(),
+            2,
+        );
+        assert_eq!(emit(&module), "local t = {}\nt.x = 1");
+    }
+
+    /// `local t = {}; t[0] = 42` — TSETB with a literal int key.
+    /// TSETB A B C: R[B][C] = R[A]. C is an inline integer literal
+    /// key, NOT a register.
+    #[test]
+    fn recover_tsetb_int_key_write() {
+        //   TNEW   0 0    (empty table → slot 0)
+        //   KSHORT 1 42   (value 42 → slot 1)
+        //   TSETB  1 0 0  (R[0][0] = R[1], i.e. t[0] = 42)
+        //   RET0   0 1.
+        let insts = vec![
+            ad(Opcode::Tnew, 0, 0),
+            ad(Opcode::Kshort, 1, 42),
+            abc(Opcode::Tsetb, 1, 0, 0),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "t", 0, 3)],
+            Vec::new(),
+            Vec::new(),
+            2,
+        );
+        assert_eq!(emit(&module), "local t = {}\nt[0] = 42");
+    }
+
+    /// `local t = {}; t[k] = v` — TSETV with a register key. Both B
+    /// (table) and C (key) are registers.
+    #[test]
+    fn recover_tsetv_register_key_write() {
+        //   TNEW   0 0     (empty table → slot 0)
+        //   GGET   1 0     (k → slot 1)
+        //   GGET   2 1     (v → slot 2)
+        //   TSETV  2 0 1   (R[0][R[1]] = R[2], i.e. t[k] = v)
+        //   RET0   0 1.
+        let insts = vec![
+            ad(Opcode::Tnew, 0, 0),
+            ad(Opcode::Gget, 1, 0),
+            ad(Opcode::Gget, 2, 1),
+            abc(Opcode::Tsetv, 2, 0, 1),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "t", 0, 4)],
+            vec![GcConst::Str(b"v".to_vec()), GcConst::Str(b"k".to_vec())],
+            Vec::new(),
+            3,
+        );
+        assert_eq!(emit(&module), "local t = {}\nt[k] = v");
+    }
+
+    /// TSETS with a non-string GC constant (e.g. an FFI cdata) bails
+    /// with NotImplemented.
+    #[test]
+    fn recover_tsets_non_string_key_not_supported() {
+        // gc_consts = [Str(t), I64(0)]. TSETS C=0 → reverse 0 →
+        // gc_consts[1] = I64 — non-string. The value and table slots
+        // are populated; only the key resolution fails.
+        let insts = vec![
+            ad(Opcode::Tnew, 0, 0),
+            ad(Opcode::Kshort, 1, 1),
+            abc(Opcode::Tsets, 1, 0, 0),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"t".to_vec()), GcConst::I64(0)],
+            Vec::new(),
+            2,
+        );
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for TSETS with non-string key, got {:?}",
+            result
+        );
+    }
+
+    /// TSET* with an uninitialized value/table/key register bails
+    /// with NotImplemented via `lookup_operand`. Slot 0 (table) and
+    /// slot 1 (value) are never written before the TSET.
+    #[test]
+    fn recover_tset_uninitialized_slots_bail() {
+        for op in [Opcode::Tsets, Opcode::Tsetv, Opcode::Tsetb] {
+            let insts = vec![abc(op, 1, 0, 0), ad(Opcode::Ret0, 0, 1)];
+            let module = module_with(insts, Vec::new(), Vec::new(), Vec::new(), 1);
+            let result = emit_module(&module);
+            assert!(
+                matches!(result, Err(DecompilerError::NotImplemented)),
+                "expected NotImplemented for {:?} with uninitialized slots, got {:?}",
+                op,
+                result
+            );
+        }
+    }
+
+    /// Direct AST test for TNEW: verifies the `Expr::Table` payload
+    /// is empty.
+    #[test]
+    fn recover_tnew_ast_shape() {
+        let insts = vec![ad(Opcode::Tnew, 0, 0), ad(Opcode::Ret1, 0, 2)];
+        let module = module_with(insts, Vec::new(), Vec::new(), Vec::new(), 1);
+        let proto = module.main_proto();
+        let cfg = Cfg::build(proto);
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        assert_eq!(ast.len(), 1, "expected just [Return]");
+        match &ast[0] {
+            Stmt::Return(Some(expr)) => {
+                assert_eq!(*expr, Expr::Table { entries: vec![] }, "return expr");
+            }
+            other => panic!("expected Return(Some(Table)), got {:?}", other),
+        }
+    }
+
+    /// Direct AST test for TDUP: verifies the entries list shape for
+    /// a mixed array/hash template.
+    #[test]
+    fn recover_tdup_ast_shape() {
+        let insts = vec![ad(Opcode::Tdup, 0, 0), ad(Opcode::Ret1, 0, 2)];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Tab(table_const(
+                vec![KtabK::Int(1)],
+                vec![(KtabK::Str(b"a".to_vec()), KtabK::Int(2))],
+            ))],
+            Vec::new(),
+            1,
+        );
+        let proto = module.main_proto();
+        let cfg = Cfg::build(proto);
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        assert_eq!(ast.len(), 1, "expected just [Return]");
+        match &ast[0] {
+            Stmt::Return(Some(expr)) => {
+                // Extract the inner Expr via Box's Deref.
+                let inner: &Expr = expr;
+                let expected = Expr::Table {
+                    entries: vec![
+                        TableEntry::Array(Expr::Int(1)),
+                        TableEntry::HashStr("a".to_string(), Expr::Int(2)),
+                    ],
+                };
+                assert_eq!(inner, &expected, "return expr");
+            }
+            other => panic!("expected Return(Some(Table)), got {:?}", other),
+        }
+    }
+
+    /// Direct AST test for TSETS: verifies the `Stmt::TableSet`
+    /// payload (target = Field, value).
+    #[test]
+    fn recover_tsets_ast_shape() {
+        let insts = vec![
+            ad(Opcode::Tnew, 0, 0),
+            ad(Opcode::Kshort, 1, 5),
+            abc(Opcode::Tsets, 1, 0, 0),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"k".to_vec())],
+            Vec::new(),
+            2,
+        );
+        let proto = module.main_proto();
+        let cfg = Cfg::build(proto);
+        let ast = recover(proto, &cfg, true).expect("recover should succeed");
+        assert_eq!(ast.len(), 1, "expected just [TableSet]");
+        match &ast[0] {
+            Stmt::TableSet { target, value } => {
+                assert_eq!(
+                    *target,
+                    Expr::Field {
+                        obj: Box::new(Expr::Table { entries: vec![] }),
+                        name: "k".to_string(),
+                    },
+                    "target"
+                );
+                assert_eq!(*value, Expr::Int(5), "value");
+            }
+            other => panic!("expected TableSet, got {:?}", other),
+        }
     }
 }
