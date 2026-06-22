@@ -14,9 +14,10 @@
 //! old walk-based emitter; the new capabilities are `if/then` (Stage
 //! 7), `if/else` (Stage 8), compound `and`/`or` conditions (Stage 9),
 //! numeric-`for` loops (Stage 10), `while`/`repeat` loops (Stage 11),
-//! regular function calls (Stage 12), and field access + method
-//! calls (Stage 13). Any CFG shape the recovery doesn't model
-//! surfaces as [`DecompilerError::NotImplemented`].
+//! regular function calls (Stage 12), field access + method
+//! calls (Stage 13), and table literals + table writes (Stage 14).
+//! Any CFG shape the recovery doesn't model surfaces as
+//! [`DecompilerError::NotImplemented`].
 //!
 //! ## Formatting invariants
 //!
@@ -33,7 +34,7 @@
 use crate::cfg::Cfg;
 use crate::ir::Module;
 use crate::number::format_lua_number;
-use crate::structure::{recover, BinOpKind, Expr, Stmt};
+use crate::structure::{recover, BinOpKind, Expr, Stmt, TableEntry};
 use crate::DecompilerError;
 
 /// Number of spaces per indentation level. Matches LuaJIT's
@@ -85,6 +86,12 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> Option<String> {
         Stmt::MethodCall { obj, method, args } => {
             Some(format!("{}{}", pad, format_method_call(obj, method, args)))
         }
+        Stmt::TableSet { target, value } => Some(format!(
+            "{}{} = {}",
+            pad,
+            format_expr(target),
+            format_expr(value)
+        )),
         Stmt::If {
             cond,
             then_body,
@@ -236,7 +243,31 @@ fn format_expr(expr: &Expr) -> String {
         Expr::Field { obj, name } => format!("{}.{}", format_expr(obj), name),
         Expr::Index { obj, key } => format!("{}[{}]", format_expr(obj), format_expr(key)),
         Expr::MethodCall { obj, method, args } => format_method_call(obj, method, args),
+        Expr::Table { entries } => format_table(entries),
     }
+}
+
+/// Format a table literal's `{entry, entry, ...}` portion (without
+/// leading indentation). Empty tables render as `{}`; non-empty
+/// tables render as `{ a, b = 1, [k] = v }` with one comma-separated
+/// entry per source position. Stage 14 does not pretty-print
+/// multi-entry tables across multiple lines (one-line output matches
+/// `luajit -bl`'s single-instruction expectation).
+fn format_table(entries: &[TableEntry]) -> String {
+    if entries.is_empty() {
+        return "{}".to_string();
+    }
+    let parts: Vec<String> = entries
+        .iter()
+        .map(|e| match e {
+            TableEntry::Array(expr) => format_expr(expr),
+            TableEntry::HashStr(key, expr) => format!("{} = {}", key, format_expr(expr)),
+            TableEntry::HashExpr(key, expr) => {
+                format!("[{}] = {}", format_expr(key), format_expr(expr))
+            }
+        })
+        .collect();
+    format!("{{{}}}", parts.join(", "))
 }
 
 /// Format a function call's `func(args...)` portion (without leading
@@ -292,7 +323,7 @@ fn binop_symbol(op: BinOpKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structure::{BinOpKind, Expr, Stmt};
+    use crate::structure::{BinOpKind, Expr, Stmt, TableEntry};
 
     // ---- format_expr / format_stmt direct tests ------------------------
     //
@@ -654,6 +685,152 @@ mod tests {
             Box::new(Expr::Global("c".to_string())),
         );
         assert_eq!(format_expr(&expr), "a and b or c");
+    }
+
+    // ---- Stage 14: table literal / table-write formatting ----------
+
+    #[test]
+    fn formats_empty_table() {
+        // `{}` — TNEW with no entries.
+        let expr = Expr::Table { entries: vec![] };
+        assert_eq!(format_expr(&expr), "{}");
+    }
+
+    #[test]
+    fn formats_array_only_table() {
+        // `{1, 2, 3}` — positional array entries.
+        let expr = Expr::Table {
+            entries: vec![
+                TableEntry::Array(Expr::Int(1)),
+                TableEntry::Array(Expr::Int(2)),
+                TableEntry::Array(Expr::Int(3)),
+            ],
+        };
+        assert_eq!(format_expr(&expr), "{1, 2, 3}");
+    }
+
+    #[test]
+    fn formats_hash_only_table() {
+        // `{a = 1, b = 2}` — string-keyed hash entries.
+        let expr = Expr::Table {
+            entries: vec![
+                TableEntry::HashStr("a".to_string(), Expr::Int(1)),
+                TableEntry::HashStr("b".to_string(), Expr::Int(2)),
+            ],
+        };
+        assert_eq!(format_expr(&expr), "{a = 1, b = 2}");
+    }
+
+    #[test]
+    fn formats_mixed_table() {
+        // `{1, 2, x = 3}` — array entries first, hash entries after.
+        let expr = Expr::Table {
+            entries: vec![
+                TableEntry::Array(Expr::Int(1)),
+                TableEntry::Array(Expr::Int(2)),
+                TableEntry::HashStr("x".to_string(), Expr::Int(3)),
+            ],
+        };
+        assert_eq!(format_expr(&expr), "{1, 2, x = 3}");
+    }
+
+    #[test]
+    fn formats_hash_expr_table() {
+        // `{[1] = "v"}` — non-string key needs bracket syntax.
+        let expr = Expr::Table {
+            entries: vec![TableEntry::HashExpr(Expr::Int(1), Expr::Str(b"v".to_vec()))],
+        };
+        assert_eq!(format_expr(&expr), "{[1] = \"v\"}");
+    }
+
+    #[test]
+    fn formats_table_with_mixed_value_types() {
+        // `{true, nil, 1.5, "s"}` — bool/nil/num/str entries.
+        let expr = Expr::Table {
+            entries: vec![
+                TableEntry::Array(Expr::True),
+                TableEntry::Array(Expr::Nil),
+                TableEntry::Array(Expr::Float(1.5)),
+                TableEntry::Array(Expr::Str(b"s".to_vec())),
+            ],
+        };
+        assert_eq!(format_expr(&expr), "{true, nil, 1.5, \"s\"}");
+    }
+
+    #[test]
+    fn formats_table_set_field_target() {
+        // `t.x = 1` — TableSet with a Field target (TSETS).
+        let stmt = Stmt::TableSet {
+            target: Expr::Field {
+                obj: Box::new(Expr::Var("t".to_string())),
+                name: "x".to_string(),
+            },
+            value: Expr::Int(1),
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "t.x = 1");
+    }
+
+    #[test]
+    fn formats_table_set_index_int_key_target() {
+        // `t[0] = 42` — TableSet with an Index target (TSETB).
+        let stmt = Stmt::TableSet {
+            target: Expr::Index {
+                obj: Box::new(Expr::Var("t".to_string())),
+                key: Box::new(Expr::Int(0)),
+            },
+            value: Expr::Int(42),
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "t[0] = 42");
+    }
+
+    #[test]
+    fn formats_table_set_index_var_key_target() {
+        // `t[k] = v` — TableSet with an Index target (TSETV).
+        let stmt = Stmt::TableSet {
+            target: Expr::Index {
+                obj: Box::new(Expr::Var("t".to_string())),
+                key: Box::new(Expr::Var("k".to_string())),
+            },
+            value: Expr::Var("v".to_string()),
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "t[k] = v");
+    }
+
+    #[test]
+    fn formats_table_set_at_nonzero_indent() {
+        // Stage 14 doesn't recover table writes inside an indented
+        // block (would need a loop body), but the formatter must
+        // still handle the AST shape.
+        let stmt = Stmt::TableSet {
+            target: Expr::Field {
+                obj: Box::new(Expr::Var("t".to_string())),
+                name: "x".to_string(),
+            },
+            value: Expr::Int(1),
+        };
+        assert_eq!(format_stmt(&stmt, 1).unwrap(), "    t.x = 1");
+    }
+
+    #[test]
+    fn formats_local_decl_with_table_rhs() {
+        // `local t = {}` — Table as RHS of a LocalDecl.
+        let stmt = Stmt::LocalDecl {
+            name: "t".to_string(),
+            expr: Expr::Table { entries: vec![] },
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "local t = {}");
+    }
+
+    #[test]
+    fn formats_return_with_table_expr() {
+        // `return {1, 2}` — Table as the returned expression.
+        let stmt = Stmt::Return(Some(Expr::Table {
+            entries: vec![
+                TableEntry::Array(Expr::Int(1)),
+                TableEntry::Array(Expr::Int(2)),
+            ],
+        }));
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "return {1, 2}");
     }
 
     #[test]
