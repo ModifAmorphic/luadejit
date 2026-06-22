@@ -15,7 +15,8 @@
 //! 7), `if/else` (Stage 8), compound `and`/`or` conditions (Stage 9),
 //! numeric-`for` loops (Stage 10), `while`/`repeat` loops (Stage 11),
 //! regular function calls (Stage 12), field access + method
-//! calls (Stage 13), and table literals + table writes (Stage 14).
+//! calls (Stage 13), table literals + table writes (Stage 14), and
+//! function literals + length operator + global assignment (Stage 15).
 //! Any CFG shape the recovery doesn't model surfaces as
 //! [`DecompilerError::NotImplemented`].
 //!
@@ -49,10 +50,10 @@ const INDENT_SPACES: usize = 4;
 /// doesn't model (if/else, loops, function calls, nested `if`,
 /// compound conditions, etc.).
 pub fn emit_module(module: &Module) -> Result<String, DecompilerError> {
-    let main = module.main_proto();
-    let cfg = Cfg::build(main);
+    let main_idx = module.protos.len() - 1;
+    let cfg = Cfg::build(&module.protos[main_idx]);
     let is_fr2 = module.header.is_fr2();
-    let ast = recover(main, &cfg, is_fr2)?;
+    let ast = recover(module, main_idx, &cfg, is_fr2)?;
     Ok(emit_ast(&ast))
 }
 
@@ -76,28 +77,35 @@ fn emit_ast(stmts: &[Stmt]) -> String {
 fn format_stmt(stmt: &Stmt, indent: usize) -> Option<String> {
     let pad = " ".repeat(indent * INDENT_SPACES);
     match stmt {
-        Stmt::LocalDecl { name, expr } => {
-            Some(format!("{}local {} = {}", pad, name, format_expr(expr)))
+        Stmt::LocalDecl { name, expr } => Some(format!(
+            "{}local {} = {}",
+            pad,
+            name,
+            format_expr(expr, indent)
+        )),
+        Stmt::Assign { name, expr } => {
+            Some(format!("{}{} = {}", pad, name, format_expr(expr, indent)))
         }
-        Stmt::Assign { name, expr } => Some(format!("{}{} = {}", pad, name, format_expr(expr))),
-        Stmt::Return(Some(expr)) => Some(format!("{}return {}", pad, format_expr(expr))),
+        Stmt::Return(Some(expr)) => Some(format!("{}return {}", pad, format_expr(expr, indent))),
         Stmt::Return(None) => None,
-        Stmt::Call { func, args } => Some(format!("{}{}", pad, format_call(func, args))),
-        Stmt::MethodCall { obj, method, args } => {
-            Some(format!("{}{}", pad, format_method_call(obj, method, args)))
-        }
+        Stmt::Call { func, args } => Some(format!("{}{}", pad, format_call(func, args, indent))),
+        Stmt::MethodCall { obj, method, args } => Some(format!(
+            "{}{}",
+            pad,
+            format_method_call(obj, method, args, indent)
+        )),
         Stmt::TableSet { target, value } => Some(format!(
             "{}{} = {}",
             pad,
-            format_expr(target),
-            format_expr(value)
+            format_expr(target, indent),
+            format_expr(value, indent)
         )),
         Stmt::If {
             cond,
             then_body,
             else_body,
         } => {
-            let mut out = format!("{}if {} then", pad, format_expr(cond));
+            let mut out = format!("{}if {} then", pad, format_expr(cond, indent));
             for inner in then_body {
                 if let Some(line) = format_stmt(inner, indent + 1) {
                     out.push('\n');
@@ -136,16 +144,16 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> Option<String> {
                     "{}for {} = {}, {} do",
                     pad,
                     var,
-                    format_expr(start),
-                    format_expr(stop)
+                    format_expr(start, indent),
+                    format_expr(stop, indent)
                 ),
                 Some(s) => format!(
                     "{}for {} = {}, {}, {} do",
                     pad,
                     var,
-                    format_expr(start),
-                    format_expr(stop),
-                    format_expr(s)
+                    format_expr(start, indent),
+                    format_expr(stop, indent),
+                    format_expr(s, indent)
                 ),
             };
             let mut out = header;
@@ -161,7 +169,7 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> Option<String> {
             Some(out)
         }
         Stmt::While { cond, body } => {
-            let mut out = format!("{}while {} do", pad, format_expr(cond));
+            let mut out = format!("{}while {} do", pad, format_expr(cond, indent));
             for inner in body {
                 if let Some(line) = format_stmt(inner, indent + 1) {
                     out.push('\n');
@@ -186,13 +194,20 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> Option<String> {
             out.push('\n');
             out.push_str(&pad);
             out.push_str("until ");
-            out.push_str(&format_expr(cond));
+            out.push_str(&format_expr(cond, indent));
             Some(out)
         }
     }
 }
 
 /// Format an expression as Lua source.
+///
+/// `indent` is the current statement-level indent (in indent units,
+/// each expanded to [`INDENT_SPACES`]). It is propagated to
+/// sub-expressions unchanged except for [`Expr::Function`], whose
+/// body statements render at `indent + 1` and whose closing `end`
+/// renders at `indent` (matching `if`/`for`/`while` body
+/// indentation).
 ///
 /// Known limitation (carried over from Stage 4): nested arithmetic
 /// is emitted without parenthesization. This works whenever Lua's
@@ -201,7 +216,7 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> Option<String> {
 /// reorders against precedence, e.g. `(a + b) * c` would be emitted
 /// as `a + b * c`. Correct parenthesization is deferred to a later
 /// stage.
-fn format_expr(expr: &Expr) -> String {
+fn format_expr(expr: &Expr, indent: usize) -> String {
     match expr {
         // `Var` and `Global` both surface as bare names at the Lua
         // source level — a global is just an unqualified identifier
@@ -218,15 +233,13 @@ fn format_expr(expr: &Expr) -> String {
         Expr::Nil => "nil".to_string(),
         Expr::True => "true".to_string(),
         Expr::False => "false".to_string(),
-        Expr::BinOp { op, left, right } => {
-            format!(
-                "{} {} {}",
-                format_expr(left),
-                binop_symbol(*op),
-                format_expr(right)
-            )
-        }
-        Expr::Not(inner) => format!("not {}", format_expr(inner)),
+        Expr::BinOp { op, left, right } => format!(
+            "{} {} {}",
+            format_expr(left, indent),
+            binop_symbol(*op),
+            format_expr(right, indent)
+        ),
+        Expr::Not(inner) => format!("not {}", format_expr(inner, indent)),
         // Stage 9: logical connectives. No parenthesization — Lua's
         // precedence is comparisons > `and` > `or`, and the test
         // fixtures don't mix `and`/`or` in a single condition, so
@@ -234,16 +247,28 @@ fn format_expr(expr: &Expr) -> String {
         // `and`/`or` chains will need a precedence-aware emitter
         // later.)
         Expr::And(left, right) => {
-            format!("{} and {}", format_expr(left), format_expr(right))
+            format!(
+                "{} and {}",
+                format_expr(left, indent),
+                format_expr(right, indent)
+            )
         }
         Expr::Or(left, right) => {
-            format!("{} or {}", format_expr(left), format_expr(right))
+            format!(
+                "{} or {}",
+                format_expr(left, indent),
+                format_expr(right, indent)
+            )
         }
-        Expr::Call { func, args } => format_call(func, args),
-        Expr::Field { obj, name } => format!("{}.{}", format_expr(obj), name),
-        Expr::Index { obj, key } => format!("{}[{}]", format_expr(obj), format_expr(key)),
-        Expr::MethodCall { obj, method, args } => format_method_call(obj, method, args),
-        Expr::Table { entries } => format_table(entries),
+        Expr::Call { func, args } => format_call(func, args, indent),
+        Expr::Field { obj, name } => format!("{}.{}", format_expr(obj, indent), name),
+        Expr::Index { obj, key } => {
+            format!("{}[{}]", format_expr(obj, indent), format_expr(key, indent))
+        }
+        Expr::MethodCall { obj, method, args } => format_method_call(obj, method, args, indent),
+        Expr::Table { entries } => format_table(entries, indent),
+        Expr::Len(inner) => format!("#{}", format_expr(inner, indent)),
+        Expr::Function { params, body } => format_function(params, body, indent),
     }
 }
 
@@ -253,17 +278,21 @@ fn format_expr(expr: &Expr) -> String {
 /// entry per source position. Stage 14 does not pretty-print
 /// multi-entry tables across multiple lines (one-line output matches
 /// `luajit -bl`'s single-instruction expectation).
-fn format_table(entries: &[TableEntry]) -> String {
+fn format_table(entries: &[TableEntry], indent: usize) -> String {
     if entries.is_empty() {
         return "{}".to_string();
     }
     let parts: Vec<String> = entries
         .iter()
         .map(|e| match e {
-            TableEntry::Array(expr) => format_expr(expr),
-            TableEntry::HashStr(key, expr) => format!("{} = {}", key, format_expr(expr)),
+            TableEntry::Array(expr) => format_expr(expr, indent),
+            TableEntry::HashStr(key, expr) => format!("{} = {}", key, format_expr(expr, indent)),
             TableEntry::HashExpr(key, expr) => {
-                format!("[{}] = {}", format_expr(key), format_expr(expr))
+                format!(
+                    "[{}] = {}",
+                    format_expr(key, indent),
+                    format_expr(expr, indent)
+                )
             }
         })
         .collect();
@@ -281,9 +310,13 @@ fn format_table(entries: &[TableEntry]) -> String {
 /// non-atomic expressions (e.g. `(a or b).method()` — Stage 13's
 /// method-call desugaring will cover this) will need to add
 /// precedence-aware parenthesization here.
-fn format_call(func: &Expr, args: &[Expr]) -> String {
-    let args_str = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
-    format!("{}({})", format_expr(func), args_str)
+fn format_call(func: &Expr, args: &[Expr], indent: usize) -> String {
+    let args_str = args
+        .iter()
+        .map(|a| format_expr(a, indent))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{}({})", format_expr(func, indent), args_str)
 }
 
 /// Format a method call's `obj:method(args...)` portion (without
@@ -295,9 +328,41 @@ fn format_call(func: &Expr, args: &[Expr]) -> String {
 /// fixtures use atomic receivers (globals / locals). Future stages
 /// that allow non-atomic receivers (e.g. `(a or b):method()`) will
 /// need precedence-aware parenthesization.
-fn format_method_call(obj: &Expr, method: &str, args: &[Expr]) -> String {
-    let args_str = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
-    format!("{}:{}({})", format_expr(obj), method, args_str)
+fn format_method_call(obj: &Expr, method: &str, args: &[Expr], indent: usize) -> String {
+    let args_str = args
+        .iter()
+        .map(|a| format_expr(a, indent))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{}:{}({})", format_expr(obj, indent), method, args_str)
+}
+
+/// Format a function literal as a multi-line expression. The
+/// `function(params)` keyword line has no leading pad (the
+/// surrounding statement supplies the prefix, e.g. `local f = `).
+/// Each body statement renders at `indent + 1`; the closing `end`
+/// renders at `indent`. An empty body collapses to
+/// `function(params)\nend`.
+///
+/// Example at `indent = 0`:
+/// ```text
+/// function(x)
+///     return x
+/// end
+/// ```
+fn format_function(params: &[String], body: &[Stmt], indent: usize) -> String {
+    let params_str = params.join(", ");
+    let mut out = format!("function({})", params_str);
+    for inner in body {
+        if let Some(line) = format_stmt(inner, indent + 1) {
+            out.push('\n');
+            out.push_str(&line);
+        }
+    }
+    out.push('\n');
+    out.push_str(&" ".repeat(indent * INDENT_SPACES));
+    out.push_str("end");
+    out
 }
 
 /// Map a [`BinOpKind`] to its Lua source operator.
@@ -334,49 +399,49 @@ mod tests {
 
     #[test]
     fn formats_int() {
-        assert_eq!(format_expr(&Expr::Int(5)), "5");
-        assert_eq!(format_expr(&Expr::Int(-7)), "-7");
-        assert_eq!(format_expr(&Expr::Int(0)), "0");
+        assert_eq!(format_expr(&Expr::Int(5), 0), "5");
+        assert_eq!(format_expr(&Expr::Int(-7), 0), "-7");
+        assert_eq!(format_expr(&Expr::Int(0), 0), "0");
     }
 
     #[test]
     fn formats_float_through_lua_formatter() {
         // The pipeline routes Float through format_lua_number; the
         // 10.0/3.0 case would round differently under Rust's `{}`.
-        assert_eq!(format_expr(&Expr::Float(10.0 / 3.0)), "3.3333333333333");
+        assert_eq!(format_expr(&Expr::Float(10.0 / 3.0), 0), "3.3333333333333");
         // The fixture value 3.14 trips clippy::approx_constant (PI);
         // we intentionally use it here to mirror the `return_float`
         // integration fixture exactly.
         #[allow(clippy::approx_constant)]
         let pi_approx = 3.14_f64;
-        assert_eq!(format_expr(&Expr::Float(pi_approx)), "3.14");
+        assert_eq!(format_expr(&Expr::Float(pi_approx), 0), "3.14");
         // Integer-valued floats print without `.0`.
-        assert_eq!(format_expr(&Expr::Float(3.0)), "3");
+        assert_eq!(format_expr(&Expr::Float(3.0), 0), "3");
     }
 
     #[test]
     fn formats_str_with_rust_debug_escaping() {
-        assert_eq!(format_expr(&Expr::Str(b"foo".to_vec())), "\"foo\"");
+        assert_eq!(format_expr(&Expr::Str(b"foo".to_vec()), 0), "\"foo\"");
         // Bytes are lossy-converted to UTF-8 before `{:?}`. Invalid
         // UTF-8 becomes the replacement char; emit never panics.
         assert_eq!(
-            format_expr(&Expr::Str(vec![0xff, 0xfe])),
+            format_expr(&Expr::Str(vec![0xff, 0xfe]), 0),
             "\"\u{fffd}\u{fffd}\""
         );
     }
 
     #[test]
     fn formats_nil_true_false() {
-        assert_eq!(format_expr(&Expr::Nil), "nil");
-        assert_eq!(format_expr(&Expr::True), "true");
-        assert_eq!(format_expr(&Expr::False), "false");
+        assert_eq!(format_expr(&Expr::Nil, 0), "nil");
+        assert_eq!(format_expr(&Expr::True, 0), "true");
+        assert_eq!(format_expr(&Expr::False, 0), "false");
     }
 
     #[test]
     fn formats_var_and_global_identically() {
         // At the Lua source level both surface as bare names.
-        assert_eq!(format_expr(&Expr::Var("x".to_string())), "x");
-        assert_eq!(format_expr(&Expr::Global("x".to_string())), "x");
+        assert_eq!(format_expr(&Expr::Var("x".to_string()), 0), "x");
+        assert_eq!(format_expr(&Expr::Global("x".to_string()), 0), "x");
     }
 
     #[test]
@@ -404,14 +469,14 @@ mod tests {
                 left: left.clone(),
                 right: right.clone(),
             };
-            assert_eq!(format_expr(&expr), format!("a {} 3", sym));
+            assert_eq!(format_expr(&expr, 0), format!("a {} 3", sym));
         }
     }
 
     #[test]
     fn formats_not() {
         assert_eq!(
-            format_expr(&Expr::Not(Box::new(Expr::Global("x".to_string())))),
+            format_expr(&Expr::Not(Box::new(Expr::Global("x".to_string()))), 0),
             "not x"
         );
     }
@@ -423,7 +488,7 @@ mod tests {
             Box::new(Expr::Global("a".to_string())),
             Box::new(Expr::Global("b".to_string())),
         );
-        assert_eq!(format_expr(&expr), "a and b");
+        assert_eq!(format_expr(&expr, 0), "a and b");
     }
 
     #[test]
@@ -433,7 +498,7 @@ mod tests {
             Box::new(Expr::Global("a".to_string())),
             Box::new(Expr::Global("b".to_string())),
         );
-        assert_eq!(format_expr(&expr), "a or b");
+        assert_eq!(format_expr(&expr, 0), "a or b");
     }
 
     // ---- Stage 12: function-call formatting ----------------------------
@@ -445,7 +510,7 @@ mod tests {
             func: Box::new(Expr::Global("f".to_string())),
             args: vec![],
         };
-        assert_eq!(format_expr(&expr), "f()");
+        assert_eq!(format_expr(&expr, 0), "f()");
     }
 
     #[test]
@@ -455,7 +520,7 @@ mod tests {
             func: Box::new(Expr::Global("print".to_string())),
             args: vec![Expr::Str(b"hello".to_vec())],
         };
-        assert_eq!(format_expr(&expr), "print(\"hello\")");
+        assert_eq!(format_expr(&expr, 0), "print(\"hello\")");
     }
 
     #[test]
@@ -469,7 +534,7 @@ mod tests {
                 Expr::Str(b"c".to_vec()),
             ],
         };
-        assert_eq!(format_expr(&expr), "print(\"a\", \"b\", \"c\")");
+        assert_eq!(format_expr(&expr, 0), "print(\"a\", \"b\", \"c\")");
     }
 
     #[test]
@@ -484,7 +549,7 @@ mod tests {
                 Expr::True,
             ],
         };
-        assert_eq!(format_expr(&expr), "f(1, \"x\", nil, true)");
+        assert_eq!(format_expr(&expr, 0), "f(1, \"x\", nil, true)");
     }
 
     #[test]
@@ -495,7 +560,7 @@ mod tests {
             func: Box::new(Expr::Global("f".to_string())),
             args: vec![Expr::Var("x".to_string())],
         };
-        assert_eq!(format_expr(&expr), "f(x)");
+        assert_eq!(format_expr(&expr, 0), "f(x)");
     }
 
     #[test]
@@ -552,7 +617,7 @@ mod tests {
             obj: Box::new(Expr::Global("obj".to_string())),
             name: "field".to_string(),
         };
-        assert_eq!(format_expr(&expr), "obj.field");
+        assert_eq!(format_expr(&expr, 0), "obj.field");
     }
 
     #[test]
@@ -562,7 +627,7 @@ mod tests {
             obj: Box::new(Expr::Var("x".to_string())),
             name: "field".to_string(),
         };
-        assert_eq!(format_expr(&expr), "x.field");
+        assert_eq!(format_expr(&expr, 0), "x.field");
     }
 
     #[test]
@@ -572,7 +637,7 @@ mod tests {
             obj: Box::new(Expr::Global("obj".to_string())),
             key: Box::new(Expr::Int(5)),
         };
-        assert_eq!(format_expr(&expr), "obj[5]");
+        assert_eq!(format_expr(&expr, 0), "obj[5]");
     }
 
     #[test]
@@ -582,7 +647,7 @@ mod tests {
             obj: Box::new(Expr::Var("t".to_string())),
             key: Box::new(Expr::Var("k".to_string())),
         };
-        assert_eq!(format_expr(&expr), "t[k]");
+        assert_eq!(format_expr(&expr, 0), "t[k]");
     }
 
     #[test]
@@ -593,7 +658,7 @@ mod tests {
             method: "method".to_string(),
             args: vec![],
         };
-        assert_eq!(format_expr(&expr), "obj:method()");
+        assert_eq!(format_expr(&expr, 0), "obj:method()");
     }
 
     #[test]
@@ -604,7 +669,7 @@ mod tests {
             method: "method".to_string(),
             args: vec![Expr::Int(1), Expr::Str(b"x".to_vec())],
         };
-        assert_eq!(format_expr(&expr), "obj:method(1, \"x\")");
+        assert_eq!(format_expr(&expr, 0), "obj:method(1, \"x\")");
     }
 
     #[test]
@@ -665,7 +730,7 @@ mod tests {
             }),
             name: "c".to_string(),
         };
-        assert_eq!(format_expr(&expr), "a.b.c");
+        assert_eq!(format_expr(&expr, 0), "a.b.c");
     }
 
     #[test]
@@ -684,7 +749,7 @@ mod tests {
             )),
             Box::new(Expr::Global("c".to_string())),
         );
-        assert_eq!(format_expr(&expr), "a and b or c");
+        assert_eq!(format_expr(&expr, 0), "a and b or c");
     }
 
     // ---- Stage 14: table literal / table-write formatting ----------
@@ -693,7 +758,7 @@ mod tests {
     fn formats_empty_table() {
         // `{}` — TNEW with no entries.
         let expr = Expr::Table { entries: vec![] };
-        assert_eq!(format_expr(&expr), "{}");
+        assert_eq!(format_expr(&expr, 0), "{}");
     }
 
     #[test]
@@ -706,7 +771,7 @@ mod tests {
                 TableEntry::Array(Expr::Int(3)),
             ],
         };
-        assert_eq!(format_expr(&expr), "{1, 2, 3}");
+        assert_eq!(format_expr(&expr, 0), "{1, 2, 3}");
     }
 
     #[test]
@@ -718,7 +783,7 @@ mod tests {
                 TableEntry::HashStr("b".to_string(), Expr::Int(2)),
             ],
         };
-        assert_eq!(format_expr(&expr), "{a = 1, b = 2}");
+        assert_eq!(format_expr(&expr, 0), "{a = 1, b = 2}");
     }
 
     #[test]
@@ -731,7 +796,7 @@ mod tests {
                 TableEntry::HashStr("x".to_string(), Expr::Int(3)),
             ],
         };
-        assert_eq!(format_expr(&expr), "{1, 2, x = 3}");
+        assert_eq!(format_expr(&expr, 0), "{1, 2, x = 3}");
     }
 
     #[test]
@@ -740,7 +805,7 @@ mod tests {
         let expr = Expr::Table {
             entries: vec![TableEntry::HashExpr(Expr::Int(1), Expr::Str(b"v".to_vec()))],
         };
-        assert_eq!(format_expr(&expr), "{[1] = \"v\"}");
+        assert_eq!(format_expr(&expr, 0), "{[1] = \"v\"}");
     }
 
     #[test]
@@ -754,7 +819,7 @@ mod tests {
                 TableEntry::Array(Expr::Str(b"s".to_vec())),
             ],
         };
-        assert_eq!(format_expr(&expr), "{true, nil, 1.5, \"s\"}");
+        assert_eq!(format_expr(&expr, 0), "{true, nil, 1.5, \"s\"}");
     }
 
     #[test]
@@ -831,6 +896,128 @@ mod tests {
             ],
         }));
         assert_eq!(format_stmt(&stmt, 0).unwrap(), "return {1, 2}");
+    }
+
+    // ---- Stage 15: function-literal / length-op formatting ----------
+
+    #[test]
+    fn formats_len_on_global() {
+        // `#t` — Len on a global.
+        let expr = Expr::Len(Box::new(Expr::Global("t".to_string())));
+        assert_eq!(format_expr(&expr, 0), "#t");
+    }
+
+    #[test]
+    fn formats_len_on_var() {
+        // `#x` — Len on a local variable.
+        let expr = Expr::Len(Box::new(Expr::Var("x".to_string())));
+        assert_eq!(format_expr(&expr, 0), "#x");
+    }
+
+    #[test]
+    fn formats_len_on_field() {
+        // `#t.n` — Len on a field access (nested expr).
+        let expr = Expr::Len(Box::new(Expr::Field {
+            obj: Box::new(Expr::Global("t".to_string())),
+            name: "n".to_string(),
+        }));
+        assert_eq!(format_expr(&expr, 0), "#t.n");
+    }
+
+    #[test]
+    fn formats_local_decl_with_len_rhs() {
+        // `local x = #t` — Len as RHS of a LocalDecl.
+        let stmt = Stmt::LocalDecl {
+            name: "x".to_string(),
+            expr: Expr::Len(Box::new(Expr::Global("t".to_string()))),
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "local x = #t");
+    }
+
+    #[test]
+    fn formats_function_no_params_empty_body() {
+        // `function()` with empty body — `function()\nend`.
+        let expr = Expr::Function {
+            params: vec![],
+            body: vec![],
+        };
+        assert_eq!(format_expr(&expr, 0), "function()\nend");
+    }
+
+    #[test]
+    fn formats_function_with_params_and_body() {
+        // `function(x, y)\n    return x + y\nend` at indent 0.
+        let expr = Expr::Function {
+            params: vec!["x".to_string(), "y".to_string()],
+            body: vec![Stmt::Return(Some(Expr::BinOp {
+                op: BinOpKind::Add,
+                left: Box::new(Expr::Var("x".to_string())),
+                right: Box::new(Expr::Var("y".to_string())),
+            }))],
+        };
+        assert_eq!(
+            format_expr(&expr, 0),
+            "function(x, y)\n    return x + y\nend"
+        );
+    }
+
+    #[test]
+    fn formats_function_at_nonzero_indent() {
+        // Inside an indented block (e.g. a loop body), the function's
+        // body tracks the surrounding indent and `end` lines up.
+        let expr = Expr::Function {
+            params: vec!["n".to_string()],
+            body: vec![Stmt::Return(Some(Expr::Var("n".to_string())))],
+        };
+        assert_eq!(
+            format_expr(&expr, 1),
+            "function(n)\n        return n\n    end"
+        );
+    }
+
+    #[test]
+    fn formats_local_decl_with_function_rhs() {
+        // `local f = function()\n    return 1\nend` — the complete
+        // FNEW fixture shape.
+        let stmt = Stmt::LocalDecl {
+            name: "f".to_string(),
+            expr: Expr::Function {
+                params: vec![],
+                body: vec![Stmt::Return(Some(Expr::Int(1)))],
+            },
+        };
+        assert_eq!(
+            format_stmt(&stmt, 0).unwrap(),
+            "local f = function()\n    return 1\nend"
+        );
+    }
+
+    #[test]
+    fn formats_assign_with_function_rhs() {
+        // `g = function(x)\n    return x\nend` — Assign variant
+        // (GSET doesn't produce this directly, but a reassigned
+        // global/local could).
+        let stmt = Stmt::Assign {
+            name: "g".to_string(),
+            expr: Expr::Function {
+                params: vec!["x".to_string()],
+                body: vec![Stmt::Return(Some(Expr::Var("x".to_string())))],
+            },
+        };
+        assert_eq!(
+            format_stmt(&stmt, 0).unwrap(),
+            "g = function(x)\n    return x\nend"
+        );
+    }
+
+    #[test]
+    fn formats_return_with_function_expr() {
+        // `return function() end` — Function as the returned expr.
+        let stmt = Stmt::Return(Some(Expr::Function {
+            params: vec![],
+            body: vec![],
+        }));
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "return function()\nend");
     }
 
     #[test]
