@@ -53,7 +53,9 @@ pub fn emit_module(module: &Module) -> Result<String, DecompilerError> {
     let main_idx = module.protos.len() - 1;
     let cfg = Cfg::build(&module.protos[main_idx]);
     let is_fr2 = module.header.is_fr2();
-    let ast = recover(module, main_idx, &cfg, is_fr2)?;
+    // The main proto has no upvalues — pass None so UGET/USETx inside
+    // it (if any) bail rather than index a missing name slice.
+    let ast = recover(module, main_idx, &cfg, is_fr2, None)?;
     Ok(emit_ast(&ast))
 }
 
