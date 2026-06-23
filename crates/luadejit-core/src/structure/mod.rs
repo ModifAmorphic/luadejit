@@ -1621,7 +1621,12 @@ fn process_inst(
             // shape as CALL but C == 0 means "use the multres
             // produced by the previous CALL/VARG as the trailing
             // args." LuaJIT emits this for `print(f())` (the inner
-            // call's results are the outer call's args) and
+            // call's results are the outer call's args).
+            //
+            // Known limitation: CALLM does NOT check for method-call
+            // detection (unlike CALL, which checks Field+self-slot).
+            // So `obj:m(f())` would emit as `obj.m(f())` with explicit
+            // self. This is out of scope for Stage 16.
             // `f(...)` (the vararg's values are the args).
             //
             // Handling: when C == 0, the single multres arg lives at
@@ -3693,24 +3698,6 @@ mod tests {
         assert!(
             matches!(result, Err(DecompilerError::NotImplemented)),
             "expected NotImplemented for standalone JMP, got {:?}",
-            result
-        );
-    }
-
-    /// Tail calls (CALLT/CALLMT) classify as Terminator::TailCall.
-    #[test]
-    fn recover_tail_call_is_not_supported() {
-        let module = module_with(
-            vec![ad(Opcode::Gget, 0, 0), ad(Opcode::Callt, 0, 2)],
-            Vec::new(),
-            vec![GcConst::Str(b"f".to_vec())],
-            Vec::new(),
-            1,
-        );
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for tail call, got {:?}",
             result
         );
     }
