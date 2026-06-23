@@ -81,6 +81,17 @@
 //! the parameter list when the child proto carries `PROTO_VARARG`;
 //! the `Terminator::TailCall` arm lowers to `Stmt::Return(Some(Expr::Call))`.
 //!
+//! **Stage 17** adds upvalue handling — the first cross-proto analysis
+//! in the project. UGET (read), USETV/USETS/USETN/USETP (write), and
+//! UCLO (close, modeled as a no-op) are recovered inside child protos.
+//! The child's [`UpvalDesc`](crate::ir::UpvalDesc) list is resolved
+//! against the PARENT's context before the child is recovered: an
+//! open upvalue (parent register) takes its name from the parent's
+//! `slot_exprs`, a closed upvalue (parent upvalue) from the parent's
+//! own resolved upvalue names. The `numuv > 0` bail in FNEW is
+//! removed; FNEW now threads the resolved names through the recursive
+//! `recover` call via the new `upvalue_names` parameter.
+//!
 //! **Stage 11** adds `while cond do … end` and `repeat … until cond`
 //! support. Both are detected at the [`ConditionalBranch`] arm of
 //! [`recover_from`]:
@@ -126,7 +137,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::cfg::{BlockId, Cfg, InstructionId, Terminator};
-use crate::ir::{GcConst, Instruction, KtabK, Module, NumConst, Opcode, Proto, TableConst};
+use crate::ir::{
+    GcConst, Instruction, KtabK, Module, NumConst, Opcode, Proto, TableConst, UpvalDesc,
+};
 use crate::DecompilerError;
 
 // ---- AST types -------------------------------------------------------
@@ -404,11 +417,20 @@ pub enum BinOpKind {
 /// `proto_idx` is the index of `proto` within `module.protos`. The
 /// FNEW handler uses `(module, proto_idx)` to resolve child protos
 /// via [`resolve_child_proto`].
+///
+/// `upvalue_names` carries the resolved source-level names for the
+/// proto's own upvalues (parallel to `proto.upvalues`), or `None`
+/// when the proto has no upvalues (the main proto) or its upvalues
+/// were not resolved. Stage 17's FNEW handler resolves a child's
+/// upvalue descriptors against the parent's context before recursing
+/// and passes the result here; UGET/USETx inside the child consult
+/// this slice to emit the captured variable's name.
 pub fn recover(
     module: &Module,
     proto_idx: usize,
     cfg: &Cfg,
     is_fr2: bool,
+    upvalue_names: Option<Vec<String>>,
 ) -> Result<Vec<Stmt>, DecompilerError> {
     let proto = &module.protos[proto_idx];
     if cfg.blocks.is_empty() {
@@ -440,6 +462,7 @@ pub fn recover(
     }
     let mut visited: HashSet<BlockId> = HashSet::new();
     let mut stmts = Vec::new();
+    let upvalue_names_slice = upvalue_names.as_deref();
     let mut ctx = RecoveryCtx {
         module,
         proto,
@@ -448,6 +471,7 @@ pub fn recover(
         is_fr2,
         slot_exprs: &mut slot_exprs,
         visited: &mut visited,
+        upvalue_names: upvalue_names_slice,
     };
     recover_from(cfg.entry, false, &mut ctx, &mut stmts)?;
     Ok(stmts)
@@ -574,6 +598,16 @@ struct RecoveryCtx<'a> {
     /// check only fires on a malformed CFG or a future loop pattern
     /// the recovery hasn't been taught to short-circuit.
     visited: &'a mut HashSet<BlockId>,
+    /// Resolved source-level names for this proto's own upvalues,
+    /// parallel to `proto.upvalues`. `None` for the main proto (it
+    /// has no upvalues) or when the names couldn't be resolved;
+    /// `Some` for child protos reached via FNEW whose upvalue
+    /// descriptors were resolved against the parent's context by
+    /// [`resolve_upvalue_names`]. UGET/USETx handlers index this
+    /// slice to emit the captured variable's name; a missing slice
+    /// (or out-of-range index) bails with
+    /// [`DecompilerError::NotImplemented`].
+    upvalue_names: Option<&'a [String]>,
 }
 
 /// Walk a chain of blocks starting at `start`, appending [`Stmt`]s
@@ -1232,6 +1266,26 @@ fn process_inst(
                 _ => return Err(DecompilerError::NotImplemented),
             }
         }
+        Opcode::Uget => {
+            // UGET A D (AD format): `R[A] = upvalue[D as usize]`.
+            // Stage 17. The upvalue's source-level name was resolved
+            // against the parent's context before this proto was
+            // recovered (stored in `ctx.upvalue_names`, parallel to
+            // `proto.upvalues`). The loaded value is recorded as an
+            // `Expr::Var(name)` so a later read (RET1, arithmetic,
+            // call operand, MOV) references the captured variable by
+            // name. No statement is emitted — UGET loads the upvalue
+            // into a compiler temp, not a source-level local; the
+            // read surfaces when a later consumer references the
+            // slot.
+            let names = ctx.upvalue_names.ok_or(DecompilerError::NotImplemented)?;
+            let idx = inst.d() as usize;
+            let name = names
+                .get(idx)
+                .ok_or(DecompilerError::NotImplemented)?
+                .clone();
+            ctx.slot_exprs.insert(inst.a, Expr::Var(name));
+        }
         Opcode::Addvn
         | Opcode::Subvn
         | Opcode::Mulvn
@@ -1309,6 +1363,20 @@ fn process_inst(
             // hint, D holds the loop exit target; both are irrelevant
             // to source recovery. Treated as a no-op so while/repeat
             // bodies (which start with a LOOP marker) walk cleanly.
+        }
+        Opcode::Uclo => {
+            // UCLO A D (AD format): close upvalues ≥ R[A]. D is a
+            // jump target with the same encoding as JMP. In practice
+            // D almost always points to the next instruction (a
+            // fall-through scope-closure marker), and the "close"
+            // operation has no source-level representation, so Stage
+            // 17 treats UCLO as a no-op. The CFG keeps UCLO in its
+            // block as a regular instruction (it is not a leader
+            // source — see `Cfg::build`), so skipping it and walking
+            // on to the next instruction is correct for the common
+            // fall-through case. The rare case where D points
+            // elsewhere is also treated as a no-op + fallthrough
+            // (per Stage 17 scope); the jump itself is not modeled.
         }
         Opcode::Call => {
             // CALL A B C — function call. Per the (empirically
@@ -1534,6 +1602,66 @@ fn process_inst(
             };
             stmts.push(Stmt::Assign { name, expr: value });
         }
+        Opcode::Usetv => {
+            // USETV A D (AD format): `upvalue[A] = R[D as u8]`. Note
+            // A is the upvalue INDEX (not a register) and the source
+            // register is the D operand's low byte. Stage 17. Emits
+            // a `Stmt::Assign` to the upvalue's name — at the source
+            // level an upvalue write is just `name = value` (the
+            // captured variable is reassigned, not redeclared).
+            let names = ctx.upvalue_names.ok_or(DecompilerError::NotImplemented)?;
+            let name = names
+                .get(inst.a as usize)
+                .ok_or(DecompilerError::NotImplemented)?
+                .clone();
+            let value = lookup_operand(ctx.slot_exprs, inst.b())?;
+            stmts.push(Stmt::Assign { name, expr: value });
+        }
+        Opcode::Usets => {
+            // USETS A D (AD format): `upvalue[A] = KSTR[reverse(D)]`.
+            // A is the upvalue index, D is a reverse-indexed GC
+            // string constant. Stage 17.
+            let names = ctx.upvalue_names.ok_or(DecompilerError::NotImplemented)?;
+            let name = names
+                .get(inst.a as usize)
+                .ok_or(DecompilerError::NotImplemented)?
+                .clone();
+            let gc = ctx.proto.gc_const_for_operand(inst.d())?;
+            let value = match gc {
+                GcConst::Str(bytes) => Expr::Str(bytes.clone()),
+                _ => return Err(DecompilerError::NotImplemented),
+            };
+            stmts.push(Stmt::Assign { name, expr: value });
+        }
+        Opcode::Usetn => {
+            // USETN A D (AD format): `upvalue[A] = KNUM[D]`. A is the
+            // upvalue index, D is a forward index into num_consts.
+            // Stage 17.
+            let names = ctx.upvalue_names.ok_or(DecompilerError::NotImplemented)?;
+            let name = names
+                .get(inst.a as usize)
+                .ok_or(DecompilerError::NotImplemented)?
+                .clone();
+            let value = build_num_const_expr(ctx.proto, inst.d() as usize)?;
+            stmts.push(Stmt::Assign { name, expr: value });
+        }
+        Opcode::Usetp => {
+            // USETP A D (AD format): `upvalue[A] = KPRI[D]`. A is the
+            // upvalue index, D is the primitive tag (0=nil, 1=false,
+            // 2=true) — same encoding as KPRI's D operand. Stage 17.
+            let names = ctx.upvalue_names.ok_or(DecompilerError::NotImplemented)?;
+            let name = names
+                .get(inst.a as usize)
+                .ok_or(DecompilerError::NotImplemented)?
+                .clone();
+            let value = match inst.d() {
+                0 => Expr::Nil,
+                1 => Expr::False,
+                2 => Expr::True,
+                _ => return Err(DecompilerError::NotImplemented),
+            };
+            stmts.push(Stmt::Assign { name, expr: value });
+        }
         Opcode::Fnew => {
             // FNEW A D (AD format): create a closure from the child
             // proto referenced by gc_consts[reverse(D)] and store it
@@ -1546,10 +1674,18 @@ fn process_inst(
             // recovered via a recursive recover() call, then wrapped
             // in Expr::Function.
             //
-            // Bail with NotImplemented for:
-            // - upvalues (numuv > 0) — deferred to a later stage
-            // - nested children (the child has its own children) —
-            //   the simple-case index formula doesn't apply
+            // Stage 17 removes the prior `numuv > 0` bail: when the
+            // child carries upvalues, their source-level names are
+            // resolved against the parent's (this proto's) context
+            // via resolve_upvalue_names before recursing, then
+            // threaded into the child's recovery so UGET/USETx can
+            // reference the captured variables. The nested-children
+            // bail (the child has its own children) stays — the
+            // simple-case child-proto index formula doesn't apply,
+            // and it also guards against the deeper-nesting
+            // closed-upvalue case (a closed upvalue can only appear
+            // when the parent itself was reached via FNEW, which the
+            // nested-children check already rejects).
             //
             // Stage 16 appends `...` to the parameter list when the
             // child proto is vararg (`PROTO_VARARG` flag set), so
@@ -1557,14 +1693,30 @@ fn process_inst(
             // round-trip with the vararg marker preserved.
             let child_idx = resolve_child_proto(ctx.module, ctx.proto_idx, inst.d())?;
             let child = &ctx.module.protos[child_idx];
-            // Upvalue capture is out of scope for Stage 15.
-            if !child.upvalues.is_empty() {
-                return Err(DecompilerError::NotImplemented);
-            }
+            // Resolve upvalue names (if any) against the parent's
+            // current context. The child borrows ctx.module
+            // immutably; resolve_upvalue_names also borrows
+            // ctx.slot_exprs immutably and reads ctx.upvalue_names
+            // (Copy) — all disjoint, no borrow conflict.
+            let child_upvalue_names = if child.upvalues.is_empty() {
+                None
+            } else {
+                Some(resolve_upvalue_names(
+                    ctx.slot_exprs,
+                    ctx.upvalue_names,
+                    &child.upvalues,
+                )?)
+            };
             // Recursively recover the child's body. A fresh
             // slot_exprs / visited set is created inside recover.
             let child_cfg = Cfg::build(child);
-            let body = recover(ctx.module, child_idx, &child_cfg, ctx.is_fr2)?;
+            let body = recover(
+                ctx.module,
+                child_idx,
+                &child_cfg,
+                ctx.is_fr2,
+                child_upvalue_names,
+            )?;
             let mut params = extract_params(child);
             if child.is_vararg() {
                 params.push("...".to_string());
@@ -1755,6 +1907,71 @@ fn extract_params(child: &Proto) -> Vec<String> {
     // Fallback: synthetic names. Matches the spec's suggestion of
     // `_1`, `_2`, ... when debug info is absent or incomplete.
     (1..=numparams).map(|i| format!("_{}", i)).collect()
+}
+
+/// Resolve a child proto's upvalue descriptors to source-level names
+/// using the PARENT's recovery context. Stage 17's first cross-proto
+/// analysis: before recovering a child proto with upvalues, each
+/// [`UpvalDesc`] must be mapped to the name of the variable it
+/// captures so UGET/USETx inside the child can emit the right
+/// identifier.
+///
+/// # Algorithm
+///
+/// For each descriptor in `child_upvalues`:
+///
+/// - **Open** ([`UpvalDesc::is_open`]): references a parent REGISTER
+///   at `index()`. The name comes from `parent_slot_exprs[index()]`,
+///   which must hold an [`Expr::Var`] (a parent local) or
+///   [`Expr::Global`] (a parent-resolved global) — the captured
+///   variable's source name. Any other slot state (missing, or an
+///   unnamed temp) bails: the parent's local must be named and in
+///   scope when the FNEW creates the closure.
+/// - **Closed** ([`UpvalDesc::is_closed`]): references a parent
+///   UPVALUE at `index()`. The name comes from `parent_upvalue_names`
+///   (the parent's own resolved names, threaded through [`RecoveryCtx`]).
+///   When the parent has no upvalue names — e.g. it's the main proto
+///   — this bails with [`DecompilerError::NotImplemented`]. Deeper
+///   nesting (a child capturing its grandparent's variable) is
+///   therefore out of scope for Stage 17; the nested-children guard
+///   in [`resolve_child_proto`] rejects the surrounding FNEW first,
+///   so this arm is primarily defensive.
+///
+/// Returns a `Vec<String>` parallel to `child_upvalues`.
+fn resolve_upvalue_names(
+    parent_slot_exprs: &HashMap<u8, Expr>,
+    parent_upvalue_names: Option<&[String]>,
+    child_upvalues: &[UpvalDesc],
+) -> Result<Vec<String>, DecompilerError> {
+    let mut names = Vec::with_capacity(child_upvalues.len());
+    for uv in child_upvalues {
+        let name = if uv.is_open() {
+            // Open upvalue: parent register at index(). Registers are
+            // 8-bit; an index outside u8 range is malformed bytecode.
+            let idx = uv.index();
+            if idx > u8::MAX as u16 {
+                return Err(DecompilerError::NotImplemented);
+            }
+            let slot = idx as u8;
+            match parent_slot_exprs.get(&slot) {
+                Some(Expr::Var(n)) | Some(Expr::Global(n)) => n.clone(),
+                // The parent's local isn't named or isn't in scope at
+                // the FNEW — can't recover a source identifier.
+                _ => return Err(DecompilerError::NotImplemented),
+            }
+        } else {
+            // Closed upvalue: parent upvalue at index(). Requires the
+            // parent's own resolved upvalue names.
+            let parent_names = parent_upvalue_names.ok_or(DecompilerError::NotImplemented)?;
+            let idx = uv.index() as usize;
+            parent_names
+                .get(idx)
+                .cloned()
+                .ok_or(DecompilerError::NotImplemented)?
+        };
+        names.push(name);
+    }
+    Ok(names)
 }
 
 /// Read a slot's [`Expr`] without removing it. Used by method-call
@@ -3254,7 +3471,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
 
         assert_eq!(ast.len(), 1, "expected just [If] (implicit RET0 → no Stmt)");
         match &ast[0] {
@@ -3418,7 +3635,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
 
         assert_eq!(ast.len(), 1, "expected just [If] (implicit RET0 → no Stmt)");
         match &ast[0] {
@@ -4036,7 +4253,7 @@ mod tests {
         let module = and_chain_module();
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [If]");
         match &ast[0] {
             Stmt::If {
@@ -4070,7 +4287,7 @@ mod tests {
         let module = or_chain_module();
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [If]");
         match &ast[0] {
             Stmt::If {
@@ -4383,7 +4600,7 @@ mod tests {
         let module = for_loop_module(standard_for_loop_var_info());
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
 
         assert_eq!(ast.len(), 1, "expected just [For] (implicit RET0)");
         match &ast[0] {
@@ -4425,7 +4642,7 @@ mod tests {
         // AST: step is Some(Int(2)).
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
         match &ast[0] {
             Stmt::For { step, .. } => {
                 assert_eq!(*step, Some(Expr::Int(2)), "step should be Int(2)");
@@ -4526,7 +4743,7 @@ mod tests {
             }],
             entry: BlockId(0),
         };
-        let result = recover(&module, 0, &cfg, true);
+        let result = recover(&module, 0, &cfg, true, None);
         assert!(
             matches!(result, Err(DecompilerError::NotImplemented)),
             "expected NotImplemented on synthetic self-referential LoopInit, got {:?}",
@@ -4661,7 +4878,7 @@ mod tests {
         let module = while_loop_module(10, true);
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
 
         assert_eq!(ast.len(), 3, "expected [LocalDecl, While, Return]");
         match &ast[0] {
@@ -4764,7 +4981,7 @@ mod tests {
         let module = repeat_loop_module(3);
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
 
         assert_eq!(ast.len(), 3, "expected [LocalDecl, Repeat, Return]");
         match &ast[0] {
@@ -4841,7 +5058,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [If]");
         assert!(
             matches!(ast[0], Stmt::If { .. }),
@@ -4880,7 +5097,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [If]");
         assert!(
             matches!(ast[0], Stmt::If { .. }),
@@ -5005,7 +5222,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
         assert_eq!(
             ast.len(),
             1,
@@ -5580,7 +5797,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
         assert_eq!(
             ast.len(),
             1,
@@ -5618,7 +5835,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [Return]");
         match &ast[0] {
             Stmt::Return(Some(expr)) => {
@@ -6177,7 +6394,7 @@ mod tests {
         let module = module_with(insts, Vec::new(), Vec::new(), Vec::new(), 1);
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [Return]");
         match &ast[0] {
             Stmt::Return(Some(expr)) => {
@@ -6204,7 +6421,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [Return]");
         match &ast[0] {
             Stmt::Return(Some(expr)) => {
@@ -6241,7 +6458,7 @@ mod tests {
         );
         let proto = module.main_proto();
         let cfg = Cfg::build(proto);
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [TableSet]");
         match &ast[0] {
             Stmt::TableSet { target, value } => {
@@ -6374,7 +6591,7 @@ mod tests {
             2,
         );
         let cfg = Cfg::build(module.main_proto());
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [Return]");
         match &ast[0] {
             Stmt::Return(Some(expr)) => {
@@ -6422,7 +6639,7 @@ mod tests {
             1,
         );
         let cfg = Cfg::build(module.main_proto());
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [Assign]");
         match &ast[0] {
             Stmt::Assign { name, expr } => {
@@ -6502,7 +6719,7 @@ mod tests {
             1,
         );
         let cfg = Cfg::build(module.main_proto());
-        let ast = recover(&module, 1, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 1, &cfg, true, None).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [LocalDecl]");
         match &ast[0] {
             Stmt::LocalDecl { name, expr } => {
@@ -6526,8 +6743,12 @@ mod tests {
     }
 
     #[test]
-    fn recover_fnew_bails_on_upvalues() {
-        // A child with numuv > 0 must bail with NotImplemented.
+    fn recover_fnew_bails_on_closed_upvalue() {
+        // A child carrying a CLOSED upvalue descriptor (references a
+        // parent upvalue, not a parent register) must bail when the
+        // parent has no resolved upvalue names — the deeper-nesting
+        // case (Stage 17 criterion 8). Here the parent is the main
+        // proto, which has no upvalues, so resolution fails.
         use crate::ir::UpvalDesc;
         let mut module = module_with_child(
             vec![ad(Opcode::Ret0, 0, 1)],
@@ -6538,13 +6759,41 @@ mod tests {
             vec![named_local(0, "f", 0, 1)],
             1,
         );
-        // Inject an upvalue into the child proto.
-        module.protos[0].upvalues.push(UpvalDesc { raw: 0x8000 });
+        // Inject a closed upvalue (LOCAL bit clear) at parent
+        // upvalue index 0.
+        module.protos[0].upvalues.push(UpvalDesc { raw: 0x0000 });
         let cfg = Cfg::build(module.main_proto());
-        let result = recover(&module, 1, &cfg, true);
+        let result = recover(&module, 1, &cfg, true, None);
         assert!(
             matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for upvalues, got {:?}",
+            "expected NotImplemented for closed upvalue, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn recover_fnew_bails_on_open_upvalue_unresolvable_slot() {
+        // An OPEN upvalue (parent register) whose parent slot has no
+        // recorded expression at FNEW time bails — the captured
+        // variable's name can't be recovered. Here the main proto's
+        // slot 0 is never written before the FNEW that consumes it.
+        use crate::ir::UpvalDesc;
+        let mut module = module_with_child(
+            vec![ad(Opcode::Ret0, 0, 1)],
+            Vec::new(),
+            0,
+            1,
+            vec![ad(Opcode::Fnew, 0, 0), ad(Opcode::Ret0, 0, 1)],
+            vec![named_local(0, "f", 0, 1)],
+            1,
+        );
+        // Inject an open upvalue (LOCAL bit set) at parent slot 0.
+        module.protos[0].upvalues.push(UpvalDesc { raw: 0x8000 });
+        let cfg = Cfg::build(module.main_proto());
+        let result = recover(&module, 1, &cfg, true, None);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for unresolvable open upvalue, got {:?}",
             result
         );
     }
@@ -6567,7 +6816,7 @@ mod tests {
         // resolve_child_proto.
         module.protos[0].gc_consts.push(GcConst::Child);
         let cfg = Cfg::build(module.main_proto());
-        let result = recover(&module, 1, &cfg, true);
+        let result = recover(&module, 1, &cfg, true, None);
         assert!(
             matches!(result, Err(DecompilerError::NotImplemented)),
             "expected NotImplemented for nested children, got {:?}",
@@ -6586,10 +6835,403 @@ mod tests {
             1,
         );
         let cfg = Cfg::build(module.main_proto());
-        let result = recover(&module, 0, &cfg, true);
+        let result = recover(&module, 0, &cfg, true, None);
         assert!(
             matches!(result, Err(DecompilerError::NotImplemented)),
             "expected NotImplemented for non-Child gc_const, got {:?}",
+            result
+        );
+    }
+
+    // ====================================================================
+    // Stage 17: upvalues (UGET / USETV / USETS / USETN / USETP / UCLO)
+    // ====================================================================
+
+    /// Build a `Module` for an upvalue fixture: a child closure
+    /// capturing one or more of the parent's locals. The child is
+    /// constructed with `child_upvalues` already populated; the main
+    /// proto's var_info must name the captured slots so resolution
+    /// succeeds. The child's `num_consts` / `gc_consts` are taken
+    /// separately so USETN / USETS fixtures can supply constants.
+    #[allow(clippy::too_many_arguments)]
+    fn module_with_upvalue_child(
+        child_insts: Vec<Instruction>,
+        child_upvalues: Vec<UpvalDesc>,
+        child_num_consts: Vec<NumConst>,
+        child_gc_consts: Vec<GcConst>,
+        child_framesize: u8,
+        main_insts: Vec<Instruction>,
+        main_var_info: Vec<VarInfo>,
+        main_gc_consts: Vec<GcConst>,
+        main_framesize: u8,
+    ) -> Module {
+        use crate::ir::FLAG_FR2;
+        let mut child_insts_full = vec![Instruction::synthetic_header(
+            Opcode::Funcf,
+            child_framesize,
+        )];
+        child_insts_full.extend(child_insts);
+        let child = Proto {
+            flags: 0,
+            numparams: 0,
+            framesize: child_framesize,
+            upvalues: child_upvalues,
+            gc_consts: child_gc_consts,
+            num_consts: child_num_consts,
+            insts: child_insts_full,
+            debug: Some(DebugInfo::default()),
+        };
+        let mut main_insts_full =
+            vec![Instruction::synthetic_header(Opcode::Funcv, main_framesize)];
+        main_insts_full.extend(main_insts);
+        let main = Proto {
+            flags: crate::ir::PROTO_CHILD,
+            numparams: 0,
+            framesize: main_framesize,
+            upvalues: Vec::<UpvalDesc>::new(),
+            gc_consts: main_gc_consts,
+            num_consts: Vec::new(),
+            insts: main_insts_full,
+            debug: Some(DebugInfo {
+                var_info: main_var_info,
+                ..DebugInfo::default()
+            }),
+        };
+        Module {
+            header: ModuleHeader {
+                flags: FLAG_FR2,
+                chunkname: None,
+            },
+            protos: vec![child, main],
+        }
+    }
+
+    // ---- resolve_upvalue_names (resolver unit tests) -----------------
+
+    #[test]
+    fn resolve_upvalue_names_open_from_var_and_global() {
+        // Open upvalue index 0 → parent slot 0 holds Var("x");
+        // open upvalue index 1 → parent slot 1 holds Global("g").
+        let mut slots: HashMap<u8, Expr> = HashMap::new();
+        slots.insert(0, Expr::Var("x".to_string()));
+        slots.insert(1, Expr::Global("g".to_string()));
+        let uvs = vec![
+            UpvalDesc { raw: 0x8000 }, // open (LOCAL bit set), index 0
+            UpvalDesc { raw: 0x8001 }, // open, index 1
+        ];
+        let names = resolve_upvalue_names(&slots, None, &uvs).expect("should resolve");
+        assert_eq!(names, vec!["x".to_string(), "g".to_string()]);
+    }
+
+    #[test]
+    fn resolve_upvalue_names_closed_uses_parent_names() {
+        // Closed upvalue (LOCAL bit clear) at parent upvalue index 0.
+        let slots: HashMap<u8, Expr> = HashMap::new();
+        let parent_names = vec!["captured".to_string()];
+        let uvs = vec![UpvalDesc { raw: 0x0000 }]; // closed, index 0
+        let names =
+            resolve_upvalue_names(&slots, Some(&parent_names), &uvs).expect("should resolve");
+        assert_eq!(names, vec!["captured".to_string()]);
+    }
+
+    #[test]
+    fn resolve_upvalue_names_closed_bails_without_parent_names() {
+        // Stage 17 criterion 8: closed upvalue when the parent has no
+        // resolved upvalue names (e.g. parent is main proto) → bail.
+        let slots: HashMap<u8, Expr> = HashMap::new();
+        let uvs = vec![UpvalDesc { raw: 0x0000 }];
+        let result = resolve_upvalue_names(&slots, None, &uvs);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn resolve_upvalue_names_open_bails_on_unnamed_slot() {
+        // Open upvalue whose parent slot holds an unnamed temp (Int)
+        // → can't recover a source identifier → bail.
+        let mut slots: HashMap<u8, Expr> = HashMap::new();
+        slots.insert(0, Expr::Int(5));
+        let uvs = vec![UpvalDesc { raw: 0x8000 }];
+        let result = resolve_upvalue_names(&slots, None, &uvs);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn resolve_upvalue_names_open_bails_on_missing_slot() {
+        // Open upvalue whose parent slot is entirely unpopulated.
+        let slots: HashMap<u8, Expr> = HashMap::new();
+        let uvs = vec![UpvalDesc { raw: 0x8000 }];
+        let result = resolve_upvalue_names(&slots, None, &uvs);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn resolve_upvalue_names_empty_for_no_upvalues() {
+        // A child with no upvalues → empty names vec (the FNEW handler
+        // passes None in this case, but the resolver handles [] too).
+        let slots: HashMap<u8, Expr> = HashMap::new();
+        let names = resolve_upvalue_names(&slots, None, &[]).expect("should resolve");
+        assert!(names.is_empty());
+    }
+
+    // ---- UGET / USETV / UCLO end-to-end -------------------------------
+
+    #[test]
+    fn emit_upvalue_read() {
+        // `local x = 42; local f = function() return x end`:
+        //   child: UGET 0 0; RET1 0 2.
+        //   main:  KSHORT 0 42; FNEW 1 0; UCLO 0; RET0 0 1.
+        let module = module_with_upvalue_child(
+            vec![ad(Opcode::Uget, 0, 0), ad(Opcode::Ret1, 0, 2)],
+            vec![UpvalDesc { raw: 0x8000 }], // open, parent slot 0
+            Vec::new(),
+            Vec::new(),
+            1,
+            vec![
+                ad(Opcode::Kshort, 0, 42),
+                ad(Opcode::Fnew, 1, 0),
+                ad(Opcode::Uclo, 0, 0), // no-op; D ignored by CFG
+                ad(Opcode::Ret0, 0, 1),
+            ],
+            vec![named_local(0, "x", 0, 3), named_local(1, "f", 1, 3)],
+            vec![GcConst::Child],
+            2,
+        );
+        assert_eq!(
+            emit(&module),
+            "local x = 42\nlocal f = function()\n    return x\nend"
+        );
+    }
+
+    #[test]
+    fn emit_upvalue_write() {
+        // `local x = 42; local f = function() x = x + 1; return x end`:
+        //   child: UGET 0 0; ADDVN 0 0 0; USETV 0 0; UGET 0 0; RET1 0 2.
+        //   main:  KSHORT 0 42; FNEW 1 0; UCLO 0; RET0 0 1.
+        let module = module_with_upvalue_child(
+            vec![
+                ad(Opcode::Uget, 0, 0),
+                abc(Opcode::Addvn, 0, 0, 0), // R[0] = R[0] + num_consts[0]
+                ad(Opcode::Usetv, 0, 0),
+                ad(Opcode::Uget, 0, 0),
+                ad(Opcode::Ret1, 0, 2),
+            ],
+            vec![UpvalDesc { raw: 0x8000 }],
+            vec![NumConst::Int(1)], // num_consts[0] = 1
+            Vec::new(),
+            1,
+            vec![
+                ad(Opcode::Kshort, 0, 42),
+                ad(Opcode::Fnew, 1, 0),
+                ad(Opcode::Uclo, 0, 0),
+                ad(Opcode::Ret0, 0, 1),
+            ],
+            vec![named_local(0, "x", 0, 3), named_local(1, "f", 1, 3)],
+            vec![GcConst::Child],
+            2,
+        );
+        assert_eq!(
+            emit(&module),
+            "local x = 42\nlocal f = function()\n    x = x + 1\n    return x\nend"
+        );
+    }
+
+    #[test]
+    fn emit_upvalue_multi() {
+        // `local x = 1; local y = 2; local f = function() return x + y end`:
+        //   child: UGET 0 0; UGET 1 1; ADDVV 0 0 1; RET1 0 2.
+        let module = module_with_upvalue_child(
+            vec![
+                ad(Opcode::Uget, 0, 0),
+                ad(Opcode::Uget, 1, 1),
+                abc(Opcode::Addvv, 0, 0, 1),
+                ad(Opcode::Ret1, 0, 2),
+            ],
+            vec![
+                UpvalDesc { raw: 0x8000 }, // open, parent slot 0 (x)
+                UpvalDesc { raw: 0x8001 }, // open, parent slot 1 (y)
+            ],
+            Vec::new(),
+            Vec::new(),
+            2,
+            vec![
+                ad(Opcode::Kshort, 0, 1),
+                ad(Opcode::Kshort, 1, 2),
+                ad(Opcode::Fnew, 2, 0),
+                ad(Opcode::Uclo, 0, 0),
+                ad(Opcode::Ret0, 0, 1),
+            ],
+            vec![
+                named_local(0, "x", 0, 4),
+                named_local(1, "y", 1, 4),
+                named_local(2, "f", 2, 4),
+            ],
+            vec![GcConst::Child],
+            3,
+        );
+        assert_eq!(
+            emit(&module),
+            "local x = 1\nlocal y = 2\nlocal f = function()\n    return x + y\nend"
+        );
+    }
+
+    // ---- UCLO as a no-op ----------------------------------------------
+
+    #[test]
+    fn emit_uclo_is_noop_in_main() {
+        // UCLO in the main proto (after FNEW) must not emit a
+        // statement. The output is just the two locals; no stray
+        // line from UCLO. (Covered end-to-end by emit_upvalue_read,
+        // but this pins the no-op behavior directly: drop the child
+        // entirely and confirm UCLO produces no output.)
+        let module = module_with(
+            vec![
+                ad(Opcode::Kshort, 0, 7),
+                ad(Opcode::Uclo, 0, 0),
+                ad(Opcode::Ret1, 0, 2),
+            ],
+            vec![named_local(0, "x", 0, 2)],
+            Vec::new(),
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "local x = 7\nreturn x");
+    }
+
+    // ---- USETS / USETN / USETP (constant upvalue writes) --------------
+
+    #[test]
+    fn emit_upvalue_usetn() {
+        // `local x; local f = function() x = 5 end`:
+        //   child: USETN 0 0; RET0 0 1.   (upvalue[0] = num_consts[0])
+        let module = module_with_upvalue_child(
+            vec![ad(Opcode::Usetn, 0, 0), ad(Opcode::Ret0, 0, 1)],
+            vec![UpvalDesc { raw: 0x8000 }],
+            vec![NumConst::Int(5)],
+            Vec::new(),
+            1,
+            vec![
+                ad(Opcode::Kpri, 0, 0), // local x = nil
+                ad(Opcode::Fnew, 1, 0),
+                ad(Opcode::Uclo, 0, 0),
+                ad(Opcode::Ret0, 0, 1),
+            ],
+            vec![named_local(0, "x", 0, 3), named_local(1, "f", 1, 3)],
+            vec![GcConst::Child],
+            2,
+        );
+        assert_eq!(
+            emit(&module),
+            "local x = nil\nlocal f = function()\n    x = 5\nend"
+        );
+    }
+
+    #[test]
+    fn emit_upvalue_usets() {
+        // `local x; local f = function() x = "hi" end`:
+        //   child: USETS 0 0; RET0 0 1.   (upvalue[0] = gc_consts[reverse(0)])
+        let module = module_with_upvalue_child(
+            vec![ad(Opcode::Usets, 0, 0), ad(Opcode::Ret0, 0, 1)],
+            vec![UpvalDesc { raw: 0x8000 }],
+            Vec::new(),
+            vec![GcConst::Str(b"hi".to_vec())],
+            1,
+            vec![
+                ad(Opcode::Kpri, 0, 0),
+                ad(Opcode::Fnew, 1, 0),
+                ad(Opcode::Uclo, 0, 0),
+                ad(Opcode::Ret0, 0, 1),
+            ],
+            vec![named_local(0, "x", 0, 3), named_local(1, "f", 1, 3)],
+            vec![GcConst::Child],
+            2,
+        );
+        assert_eq!(
+            emit(&module),
+            "local x = nil\nlocal f = function()\n    x = \"hi\"\nend"
+        );
+    }
+
+    #[test]
+    fn emit_upvalue_usetp() {
+        // `local x; local f = function() x = true end`:
+        //   child: USETP 0 2; RET0 0 1.   (upvalue[0] = KPRI[2] = true)
+        let module = module_with_upvalue_child(
+            vec![ad(Opcode::Usetp, 0, 2), ad(Opcode::Ret0, 0, 1)],
+            vec![UpvalDesc { raw: 0x8000 }],
+            Vec::new(),
+            Vec::new(),
+            1,
+            vec![
+                ad(Opcode::Kpri, 0, 0),
+                ad(Opcode::Fnew, 1, 0),
+                ad(Opcode::Uclo, 0, 0),
+                ad(Opcode::Ret0, 0, 1),
+            ],
+            vec![named_local(0, "x", 0, 3), named_local(1, "f", 1, 3)],
+            vec![GcConst::Child],
+            2,
+        );
+        assert_eq!(
+            emit(&module),
+            "local x = nil\nlocal f = function()\n    x = true\nend"
+        );
+    }
+
+    #[test]
+    fn emit_upvalue_usetp_nil() {
+        // USETP 0 0 → upvalue[0] = nil.
+        let module = module_with_upvalue_child(
+            vec![ad(Opcode::Usetp, 0, 0), ad(Opcode::Ret0, 0, 1)],
+            vec![UpvalDesc { raw: 0x8000 }],
+            Vec::new(),
+            Vec::new(),
+            1,
+            vec![
+                ad(Opcode::Kpri, 0, 0),
+                ad(Opcode::Fnew, 1, 0),
+                ad(Opcode::Uclo, 0, 0),
+                ad(Opcode::Ret0, 0, 1),
+            ],
+            vec![named_local(0, "x", 0, 3), named_local(1, "f", 1, 3)],
+            vec![GcConst::Child],
+            2,
+        );
+        assert_eq!(
+            emit(&module),
+            "local x = nil\nlocal f = function()\n    x = nil\nend"
+        );
+    }
+
+    // ---- UGET/USETx without resolved upvalue names bail ---------------
+
+    #[test]
+    fn emit_uget_bails_without_upvalue_names() {
+        // A UGET at the main-proto level (ctx.upvalue_names is None)
+        // must bail — the main proto has no upvalues.
+        let module = module_with(
+            vec![ad(Opcode::Uget, 0, 0), ad(Opcode::Ret1, 0, 2)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            1,
+        );
+        let cfg = Cfg::build(module.main_proto());
+        let result = recover(&module, 0, &cfg, true, None);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for UGET without upvalue names, got {:?}",
             result
         );
     }
@@ -6698,7 +7340,7 @@ mod tests {
             3,
         );
         let cfg = Cfg::build(module.main_proto());
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [LocalDeclMulti]");
         match &ast[0] {
             Stmt::LocalDeclMulti { names, expr } => {
@@ -6963,7 +7605,7 @@ mod tests {
             }],
         };
         let cfg = Cfg::build(module.main_proto());
-        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
         assert_eq!(ast.len(), 1, "expected just [Return]");
         match &ast[0] {
             Stmt::Return(Some(expr)) => assert_eq!(*expr, Expr::Vararg, "return expr"),
