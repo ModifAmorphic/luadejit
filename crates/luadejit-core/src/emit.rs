@@ -170,6 +170,32 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> Option<String> {
             out.push_str("end");
             Some(out)
         }
+        Stmt::ForIn {
+            vars,
+            iterator,
+            body,
+        } => {
+            // `for k, v in iterator do body end` — vars are
+            // comma-separated; the iterator is a single expression
+            // (typically a call like `pairs(t)`).
+            let header = format!(
+                "{}for {} in {} do",
+                pad,
+                vars.join(", "),
+                format_expr(iterator, indent)
+            );
+            let mut out = header;
+            for inner in body {
+                if let Some(line) = format_stmt(inner, indent + 1) {
+                    out.push('\n');
+                    out.push_str(&line);
+                }
+            }
+            out.push('\n');
+            out.push_str(&pad);
+            out.push_str("end");
+            Some(out)
+        }
         Stmt::While { cond, body } => {
             let mut out = format!("{}while {} do", pad, format_expr(cond, indent));
             for inner in body {
@@ -1336,6 +1362,94 @@ mod tests {
             format_stmt(&stmt, 1).unwrap(),
             "    repeat\n        return 1\n    until x"
         );
+    }
+
+    // ---- Stage 17 part 2: generic-for (ForIn) formatting ----------
+
+    #[test]
+    fn formats_for_in_two_vars() {
+        // `for k, v in pairs(t) do <body> end` — typical pairs iteration.
+        let stmt = Stmt::ForIn {
+            vars: vec!["k".to_string(), "v".to_string()],
+            iterator: Expr::Call {
+                func: Box::new(Expr::Global("pairs".to_string())),
+                args: vec![Expr::Global("t".to_string())],
+            },
+            body: vec![Stmt::Call {
+                func: Expr::Global("print".to_string()),
+                args: vec![Expr::Var("k".to_string()), Expr::Var("v".to_string())],
+            }],
+        };
+        assert_eq!(
+            format_stmt(&stmt, 0).unwrap(),
+            "for k, v in pairs(t) do\n    print(k, v)\nend"
+        );
+    }
+
+    #[test]
+    fn formats_for_in_single_var() {
+        // `for k in pairs(t) do print(k) end` — single loop variable.
+        let stmt = Stmt::ForIn {
+            vars: vec!["k".to_string()],
+            iterator: Expr::Call {
+                func: Box::new(Expr::Global("pairs".to_string())),
+                args: vec![Expr::Global("t".to_string())],
+            },
+            body: vec![Stmt::Call {
+                func: Expr::Global("print".to_string()),
+                args: vec![Expr::Var("k".to_string())],
+            }],
+        };
+        assert_eq!(
+            format_stmt(&stmt, 0).unwrap(),
+            "for k in pairs(t) do\n    print(k)\nend"
+        );
+    }
+
+    #[test]
+    fn formats_for_in_empty_body() {
+        // `for k in pairs(t) do end` — empty body collapses to
+        // header + `end`.
+        let stmt = Stmt::ForIn {
+            vars: vec!["k".to_string()],
+            iterator: Expr::Call {
+                func: Box::new(Expr::Global("pairs".to_string())),
+                args: vec![Expr::Global("t".to_string())],
+            },
+            body: vec![],
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "for k in pairs(t) do\nend");
+    }
+
+    #[test]
+    fn formats_for_in_at_nonzero_indent() {
+        // Inside an indented block (Stage 17 doesn't recover nested
+        // generic-for, but the formatter must still handle it).
+        let stmt = Stmt::ForIn {
+            vars: vec!["i".to_string()],
+            iterator: Expr::Call {
+                func: Box::new(Expr::Global("ipairs".to_string())),
+                args: vec![Expr::Var("t".to_string())],
+            },
+            body: vec![Stmt::Return(Some(Expr::Var("i".to_string())))],
+        };
+        assert_eq!(
+            format_stmt(&stmt, 1).unwrap(),
+            "    for i in ipairs(t) do\n        return i\n    end"
+        );
+    }
+
+    #[test]
+    fn formats_for_in_with_iterator_expression() {
+        // `for k, v in next, t do end` — iterator is a non-call
+        // expression. The formatter doesn't care about the iterator's
+        // shape; it just renders the expr.
+        let stmt = Stmt::ForIn {
+            vars: vec!["k".to_string()],
+            iterator: Expr::Global("next".to_string()),
+            body: vec![],
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "for k in next do\nend");
     }
 
     #[test]

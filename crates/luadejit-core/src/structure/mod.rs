@@ -171,6 +171,17 @@ pub enum Stmt {
         step: Option<Expr>,
         body: Vec<Stmt>,
     },
+    /// `for k[, v[, ...]] in iterator do body end` (Stage 17 part 2).
+    /// Lowered from a generic-for loop's ISNEXT/ITERN/ITERL sequence.
+    /// `vars` holds the visible loop variable names (k, v, …) in
+    /// source order; `iterator` is the call expression that
+    /// produces the iterator triple (e.g. `pairs(t)`); `body` is the
+    /// recovered loop body.
+    ForIn {
+        vars: Vec<String>,
+        iterator: Expr,
+        body: Vec<Stmt>,
+    },
     /// `while cond do body end` (Stage 11). The condition is the
     /// complement of the ISxx test (so `while i < 10` is recovered
     /// from an ISGE testing `i >= 10`).
@@ -1007,23 +1018,19 @@ fn recover_from(
                 break;
             }
             Terminator::LoopInit { base, exit, body } => {
-                // Numeric-for loop start. Process the prefix
-                // instructions (start/stop/step loads into slots A,
-                // A+1, A+2), then read the three operands back as
-                // Exprs, look up the loop variable name at slot A+3
-                // (kind=Name in debug info), and recurse into the
-                // body. The body's terminator is `LoopLatch`, which
-                // stops the walk at the back-edge rather than
-                // following it.
+                // Numeric-for (FORI, Stage 10) or generic-for (ISNEXT,
+                // Stage 17 part 2) loop start. Process the prefix
+                // instructions, then dispatch on the block's trailing
+                // opcode to recover the right loop shape.
                 if stop_at_merge {
-                    // A LoopInit inside a branch body is a loop
-                    // nested in an `if` — Stage 10 doesn't model that.
+                    // A LoopInit inside a branch body is a loop nested
+                    // in an `if` — Stage 10/17 don't model that.
                     return Err(DecompilerError::NotImplemented);
                 }
-                // The FORI itself is the trailing instruction; every
-                // earlier instruction in the block is the pre-loop
-                // setup. The FORI initializes slot A+3 implicitly, so
-                // we never `process_inst` it.
+                // The FORI/ISNEXT itself is the trailing instruction;
+                // every earlier instruction in the block is the
+                // pre-loop setup. The terminator initializes the loop
+                // slots implicitly, so we never `process_inst` it.
                 let last_idx = block.insts.last().map(|id| id.0 as usize).unwrap();
                 for inst_id in &block.insts {
                     if (inst_id.0 as usize) == last_idx {
@@ -1031,71 +1038,168 @@ fn recover_from(
                     }
                     process_inst(ctx, stmts, *inst_id)?;
                 }
-                // Read the start/stop/step Exprs from the slot map.
-                let start = lookup_operand(ctx.slot_exprs, base)?;
-                let stop = lookup_operand(ctx.slot_exprs, base + 1)?;
-                let step_expr = lookup_operand(ctx.slot_exprs, base + 2)?;
-                // LuaJIT emits an explicit `KSHORT A+2 1` even when
-                // the user wrote no step. Collapse Expr::Int(1) back
-                // to None so emit produces `for i = 1, 10 do` rather
-                // than `for i = 1, 10, 1 do`. Any other step value
-                // (including Expr::Float(1.0)) is preserved verbatim.
-                let step = if step_expr == Expr::Int(1) {
-                    None
-                } else {
-                    Some(step_expr)
-                };
-                // The loop variable name is stored in debug info as a
-                // VarKind::Name record at slot A+3 (verified
-                // empirically: the ForIdx/ForStop/ForStep records
-                // occupy slots A, A+1, A+2 and carry no source name;
-                // the visible loop variable gets its own Name record
-                // at slot A+3). Look it up at the FORI's
-                // real-instruction index — the variable's scope_begin
-                // equals the FORI's real_idx in all observed fixtures.
-                let fori_real_idx = last_idx - 1;
-                let var_name = ctx
-                    .proto
-                    .var_name_at(base + 3, fori_real_idx)
-                    .ok_or(DecompilerError::NotImplemented)?
-                    .to_string();
-                // Make the loop variable visible inside the body:
-                // slot A+3 resolves to `Expr::Var(name)` so a `MOV
-                // dst, A+3` reads as `dst = i`, a `RET1 A+3 2` reads
-                // as `return i`, etc.
-                ctx.slot_exprs.insert(base + 3, Expr::Var(var_name.clone()));
-                // Process the body. The walk follows Fallthroughs
-                // through the body's blocks until it hits the
-                // `LoopLatch` block, where it stops at the back-edge.
-                let mut body_stmts: Vec<Stmt> = Vec::new();
-                recover_from(body, true, ctx, &mut body_stmts)?;
-                stmts.push(Stmt::For {
-                    var: var_name,
-                    start,
-                    stop,
-                    step,
-                    body: body_stmts,
-                });
-                // Continue the outer walk at the loop exit. The
-                // LoopLatch's fall-through and any "dead" LoopLatch
-                // block (unreachable when the body returns) are
-                // skipped: the exit is encoded directly in LoopInit.
-                current = Some(exit);
+                let loop_op = ctx.proto.insts[last_idx].op;
+                match loop_op {
+                    Opcode::Fori => {
+                        // Numeric-for: read the start/stop/step Exprs
+                        // from the slot map.
+                        let start = lookup_operand(ctx.slot_exprs, base)?;
+                        let stop = lookup_operand(ctx.slot_exprs, base + 1)?;
+                        let step_expr = lookup_operand(ctx.slot_exprs, base + 2)?;
+                        // LuaJIT emits an explicit `KSHORT A+2 1` even
+                        // when the user wrote no step. Collapse
+                        // Expr::Int(1) back to None so emit produces
+                        // `for i = 1, 10 do` rather than `for i = 1,
+                        // 10, 1 do`. Any other step value (including
+                        // Expr::float(1.0)) is preserved verbatim.
+                        let step = if step_expr == Expr::Int(1) {
+                            None
+                        } else {
+                            Some(step_expr)
+                        };
+                        // The loop variable name is stored in debug
+                        // info as a VarKind::Name record at slot A+3.
+                        // Look it up at the FORI's real-instruction
+                        // index — the variable's scope_begin equals
+                        // the FORI's real_idx in all observed fixtures.
+                        let fori_real_idx = last_idx - 1;
+                        let var_name = ctx
+                            .proto
+                            .var_name_at(base + 3, fori_real_idx)
+                            .ok_or(DecompilerError::NotImplemented)?
+                            .to_string();
+                        // Make the loop variable visible inside the
+                        // body: slot A+3 resolves to `Expr::Var(name)`
+                        // so a `MOV dst, A+3` reads as `dst = i`, a
+                        // `RET1 A+3 2` reads as `return i`, etc.
+                        ctx.slot_exprs.insert(base + 3, Expr::Var(var_name.clone()));
+                        // Process the body. The walk follows
+                        // Fallthroughs through the body's blocks until
+                        // it hits the `LoopLatch` block, where it
+                        // stops at the back-edge.
+                        let mut body_stmts: Vec<Stmt> = Vec::new();
+                        recover_from(body, true, ctx, &mut body_stmts)?;
+                        stmts.push(Stmt::For {
+                            var: var_name,
+                            start,
+                            stop,
+                            step,
+                            body: body_stmts,
+                        });
+                        // Continue the outer walk at the loop exit.
+                        // The LoopLatch's fall-through and any "dead"
+                        // LoopLatch block (unreachable when the body
+                        // returns) are skipped: the exit is encoded
+                        // directly in LoopInit. (FORI's D target IS
+                        // the real exit.)
+                        current = Some(exit);
+                    }
+                    Opcode::Isnext => {
+                        // Generic-for loop. The iterator expression is
+                        // the CALL preceding ISNEXT that produced the
+                        // 3 iterator-state slots (A-3, A-2, A-1).
+                        // process_inst stored that call expr at slot
+                        // A-3 via route_call_result's unnamed-slots
+                        // path (Stage 17 part 2). Look it up.
+                        if base < 3 {
+                            // Malformed: ISNEXT without enough room
+                            // for the iterator-state triple.
+                            return Err(DecompilerError::NotImplemented);
+                        }
+                        let iterator_slot = base - 3;
+                        let iterator = ctx
+                            .slot_exprs
+                            .get(&iterator_slot)
+                            .cloned()
+                            .ok_or(DecompilerError::NotImplemented)?;
+                        // Loop variables: walk slots A, A+1, … and
+                        // collect their debug-info names. Each loop
+                        // variable has a VarKind::Name record with
+                        // scope_begin = the ISNEXT's real_idx. The
+                        // walk stops at the first unnamed slot — the
+                        // body's locals are declared later (different
+                        // scope_begin), so they don't interfere.
+                        let isnext_real_idx = last_idx - 1;
+                        let mut vars: Vec<String> = Vec::new();
+                        let mut slot = base;
+                        while let Some(name) = ctx.proto.var_name_at(slot, isnext_real_idx) {
+                            vars.push(name.to_string());
+                            slot = match slot.checked_add(1) {
+                                Some(s) => s,
+                                None => break,
+                            };
+                        }
+                        if vars.is_empty() {
+                            // No named loop variables — likely a
+                            // stripped proto. Bail rather than invent
+                            // synthetic names (consistent with the
+                            // spec's "if names are missing, bail").
+                            return Err(DecompilerError::NotImplemented);
+                        }
+                        // Make the loop variables visible inside the
+                        // body: slot A+i resolves to `Expr::Var(name)`
+                        // so a `MOV dst, A` reads as `dst = k`, etc.
+                        for (i, name) in vars.iter().enumerate() {
+                            ctx.slot_exprs
+                                .insert(base + i as u8, Expr::Var(name.clone()));
+                        }
+                        // Process the body. For generic-for the body
+                        // block's terminator is typically Fallthrough
+                        // into the latch (ITERN + ITERL) block; the
+                        // stop-at-merge check keeps the body recovery
+                        // out of the latch. recover_from returns with
+                        // last_block = body block.
+                        let mut body_stmts: Vec<Stmt> = Vec::new();
+                        recover_from(body, true, ctx, &mut body_stmts)?;
+                        stmts.push(Stmt::ForIn {
+                            vars,
+                            iterator,
+                            body: body_stmts,
+                        });
+                        // Continue the outer walk at the loop exit.
+                        // Unlike FORI, ISNEXT's D target lands at the
+                        // latch block (containing ITERN + ITERL)
+                        // rather than past ITERL — verified
+                        // empirically via `luajit -bl`. The real loop
+                        // exit is the latch's own LoopLatch exit. If
+                        // `exit` is a LoopLatch, advance to its exit
+                        // and mark the latch visited; otherwise fall
+                        // back to `exit` directly.
+                        let real_exit = match ctx.cfg.blocks[exit.0 as usize].terminator {
+                            Terminator::LoopLatch {
+                                exit: latch_exit, ..
+                            } => {
+                                ctx.visited.insert(exit);
+                                latch_exit
+                            }
+                            _ => exit,
+                        };
+                        current = Some(real_exit);
+                    }
+                    // Any other opcode here is a logic bug — the CFG
+                    // builder only emits LoopInit for FORI/ISNEXT.
+                    _ => unreachable!(
+                        "LoopInit block terminator must be FORI or ISNEXT, got {:?}",
+                        loop_op
+                    ),
+                }
             }
             Terminator::LoopLatch { .. } => {
-                // Loop back-edge terminator (FORL). Process the
-                // prefix instructions (everything except the FORL
-                // itself), then stop without following the back-edge.
-                // The loop body ends here; the FORL's body target is
-                // the body start (already visited by the time we'd
-                // reach the back-edge).
+                // Loop back-edge terminator (FORL/ITERL). Process the
+                // prefix instructions (everything except the FORL/ITERL
+                // itself — for generic-for this includes the ITERN that
+                // advances the iterator, which is a no-op for source
+                // recovery), then stop without following the
+                // back-edge. The loop body ends here; the latch's body
+                // target is the body start (already visited by the
+                // time we'd reach the back-edge).
                 //
                 // We only enter a LoopLatch block from inside a loop
                 // body (the LoopInit arm calls `recover_from(body,
                 // ...)`). Encountering one at the top level would
-                // mean a malformed CFG (a FORL without a matching
-                // FORI); the visited check or earlier bail would have
-                // caught it before now.
+                // mean a malformed CFG (a FORL/ITERL without a
+                // matching FORI/ISNEXT); the visited check or
+                // earlier bail would have caught it before now.
                 let last_idx = block.insts.last().map(|id| id.0 as usize).unwrap();
                 for inst_id in &block.insts {
                     if (inst_id.0 as usize) == last_idx {
@@ -1364,6 +1468,34 @@ fn process_inst(
             // to source recovery. Treated as a no-op so while/repeat
             // bodies (which start with a LOOP marker) walk cleanly.
         }
+        Opcode::Itern => {
+            // ITERN A B C — generic-for iterator advancement (Stage
+            // 17 part 2). Calls the iterator function and writes the
+            // next k, v, … values into the loop-variable slots.
+            // Transparent at the source level (the iteration is
+            // driven by the surrounding `for k, v in … do … end`),
+            // so this is a no-op for recovery. The LoopInit arm
+            // already populated the loop-variable slot_exprs from
+            // debug info; ITERN's runtime effect doesn't surface as
+            // a separate source statement.
+            //
+            // ITERN is part of the latch block (it precedes ITERL);
+            // the LoopLatch arm processes the block's prefix
+            // instructions, which routes here.
+        }
+        Opcode::Tsetm => {
+            // TSETM A D — multres table population (Stage 17 part 2
+            // bail). Writes the multres results of the previous
+            // instruction (a VARG or CALL with multres output) into
+            // the array part of the table at slot A, starting at
+            // index D. The implementation requires tracking the
+            // previous instruction's multres count and appending the
+            // values as additional array entries on the table
+            // literal — deferred to a later stage. Bail with
+            // NotImplemented so the surrounding decompile surfaces
+            // the limitation cleanly.
+            return Err(DecompilerError::NotImplemented);
+        }
         Opcode::Uclo => {
             // UCLO A D (AD format): close upvalues ≥ R[A]. D is a
             // jump target with the same encoding as JMP. In practice
@@ -1458,9 +1590,28 @@ fn process_inst(
                     func: Box::new(func),
                     args,
                 };
-                route_call_result(
-                    ctx, stmts, inst, real_idx, call_expr, /* method = */ false,
-                )?;
+                // Generic-for iterator-setup detection (Stage 17 part
+                // 2). When this CALL is immediately followed by
+                // ISNEXT, it produces the 3 iterator-state slots
+                // (A..A+2) that the surrounding generic-for consumes.
+                // The result slots carry VarKind::ForGen/ForState/ForCtl
+                // records (not Name), so route_call_result's
+                // multi-name declaration path can't fire and would
+                // bail. Intercept the case here and store the call
+                // expr at slot A for the LoopInit (ISNEXT) recovery
+                // to read via `slot_exprs[base - 3]`.
+                let next_is_isnext = ctx
+                    .proto
+                    .insts
+                    .get(idx + 1)
+                    .is_some_and(|next| next.op == Opcode::Isnext);
+                if next_is_isnext {
+                    ctx.slot_exprs.insert(inst.a, call_expr);
+                } else {
+                    route_call_result(
+                        ctx, stmts, inst, real_idx, call_expr, /* method = */ false,
+                    )?;
+                }
             }
         }
         Opcode::Tgets => {
@@ -1768,26 +1919,31 @@ fn process_inst(
                 _ => return Err(DecompilerError::NotImplemented),
             }
         }
-        Opcode::Callm if inst.c == 0 => {
+        Opcode::Callm => {
             // CALLM A B C — call with multres args (Stage 16). Same
-            // shape as CALL but C == 0 means "use the multres
-            // produced by the previous CALL/VARG as the trailing
-            // args." LuaJIT emits this for `print(f())` (the inner
-            // call's results are the outer call's args).
+            // shape as CALL, but the multres results of the previous
+            // CALL/VARG append after the C fixed args. LuaJIT emits
+            // this for `print(f())` (the inner call's results are
+            // the outer call's args) and `f(...)` (the vararg's
+            // values are the args).
             //
-            // Known limitation: CALLM does NOT check for method-call
-            // detection (unlike CALL, which checks Field+self-slot).
-            // So `obj:m(f())` would emit as `obj.m(f())` with explicit
-            // self. This is out of scope for Stage 16.
-            // `f(...)` (the vararg's values are the args).
+            // Arg layout: C = number of fixed args (including self
+            // for method calls). Multres appends at slot
+            // `arg_base + C`. For non-method C=0 (multres-only),
+            // the multres is at `arg_base` itself. Stage 16 modeled
+            // only the non-method C=0 case; Stage 17 part 2 extends
+            // to method calls (any C ≥ 1).
             //
-            // Handling: when C == 0, the single multres arg lives at
-            // arg_base (same slot the previous CALL/VARG wrote its
-            // results into). Pull that expression and use it as the
-            // sole argument. When C > 0, the call has C-1 fixed args
-            // *plus* a trailing multres slot at arg_base + (C-1);
-            // Stage 16 doesn't model the mixed case — bail (falls
-            // through to the `_` arm).
+            // Method-call detection (Stage 17 part 2): same logic as
+            // the CALL arm — when the base slot holds an
+            // `Expr::Field` and the self slot (arg_base) holds the
+            // Field's `obj`, the call desugars to `obj:method(args)`
+            // with the implicit self dropped. This handles
+            // `obj:m(f())` → `obj:m(f())` instead of the explicit-self
+            // form. The spec text suggested gating on C=0, but
+            // empirically `obj:m(f())` lowers to C=1 (self counts as
+            // a fixed arg); allowing method detection for any C
+            // matches the spec's stated example.
             //
             // Result handling (B) is identical to CALL: route through
             // route_call_result so multres (B == 0), bare call
@@ -1795,12 +1951,51 @@ fn process_inst(
             // (B > 2) all work the same way.
             let arg_base = if ctx.is_fr2 { inst.a + 2 } else { inst.a + 1 };
             let func = lookup_operand(ctx.slot_exprs, inst.a)?;
-            let multres_arg = lookup_operand(ctx.slot_exprs, arg_base)?;
-            let call_expr = Expr::Call {
-                func: Box::new(func),
-                args: vec![multres_arg],
+            let method_call = match &func {
+                Expr::Field { obj, name } => slot_exprs_get(ctx.slot_exprs, arg_base)
+                    .is_some_and(|self_expr| self_expr == obj.as_ref())
+                    .then(|| (obj.as_ref().clone(), name.clone())),
+                _ => None,
             };
-            route_call_result(ctx, stmts, inst, real_idx, call_expr, false)?;
+            if let Some((obj, method)) = method_call {
+                // Method call with multres trailing args. Self at
+                // arg_base (implicit, dropped); C-1 explicit args
+                // at arg_base+1..arg_base+C; multres at arg_base+C
+                // (after self + explicit args). For C=1
+                // (`obj:m(f())`) there are no explicit args; the
+                // multres is at arg_base+1.
+                let explicit_count = (inst.c as usize).saturating_sub(1);
+                let mut args: Vec<Expr> = Vec::with_capacity(explicit_count + 1);
+                let explicit_end = arg_base
+                    .saturating_add(1)
+                    .saturating_add(explicit_count as u8);
+                for slot in (arg_base + 1)..explicit_end {
+                    args.push(lookup_operand(ctx.slot_exprs, slot)?);
+                }
+                let multres_slot = arg_base.saturating_add(inst.c);
+                args.push(lookup_operand(ctx.slot_exprs, multres_slot)?);
+                let call_expr = Expr::MethodCall {
+                    obj: Box::new(obj),
+                    method,
+                    args,
+                };
+                route_call_result(ctx, stmts, inst, real_idx, call_expr, true)?;
+            } else if inst.c == 0 {
+                // Non-method multres-only call: the single multres
+                // arg lives at arg_base (same slot the previous
+                // CALL/VARG wrote its results into). Pull that
+                // expression and use it as the sole argument.
+                let multres_arg = lookup_operand(ctx.slot_exprs, arg_base)?;
+                let call_expr = Expr::Call {
+                    func: Box::new(func),
+                    args: vec![multres_arg],
+                };
+                route_call_result(ctx, stmts, inst, real_idx, call_expr, false)?;
+            } else {
+                // Non-method mixed (C-1 fixed args + trailing
+                // multres). Stage 17 doesn't model this — bail.
+                return Err(DecompilerError::NotImplemented);
+            }
         }
         _ => return Err(DecompilerError::NotImplemented),
     }
@@ -2063,6 +2258,15 @@ fn assign_slot_ast(
 ///   declaration/temp slots or method calls bail with
 ///   [`DecompilerError::NotImplemented`] — those shapes don't have
 ///   a clean Lua source representation.
+///
+/// Note: the generic-for iterator-setup CALL (`CALL A 4 2` followed
+/// by ISNEXT) does NOT come through here — the CALL arm in
+/// [`process_inst`] detects the ISNEXT lookahead and stores the
+/// call expr directly, bypassing this function's multi-result
+/// handling. That's because the iterator-state slots (kind =
+/// ForGen/ForState/ForCtl) aren't Name records, so the multi-name
+/// declaration path can't fire; we want to silently thread the call
+/// expr through to the LoopInit recovery, not bail.
 fn route_call_result(
     ctx: &mut RecoveryCtx,
     stmts: &mut Vec<Stmt>,
@@ -4793,6 +4997,263 @@ mod tests {
         assert!(
             matches!(result, Err(DecompilerError::NotImplemented)),
             "expected NotImplemented for nested loop in if-body, got {:?}",
+            result
+        );
+    }
+
+    // ====================================================================
+    // Stage 17 part 2: generic-for recovery unit tests
+    // ====================================================================
+    //
+    // The integration tests in `tests/stage17b_generic_for.rs` cover
+    // the end-to-end pipeline. The unit tests below isolate the
+    // generic-for detection logic at the AST level so failures point
+    // at the right layer.
+
+    /// Build the var_info records LuaJIT emits for
+    /// `for k, v in pairs(t) do print(k, v) end` (verified empirically
+    /// via the IR parser). The iterator-state slots 0..2 carry
+    /// compiler-internal kinds (ForGen/ForState/ForCtl); the visible
+    /// loop variables at slots 3 and 4 are user-named via VarKind::Name.
+    fn generic_for_var_info() -> Vec<VarInfo> {
+        vec![
+            for_loop_var(VarKind::ForGen, 0, 2, 8),
+            for_loop_var(VarKind::ForState, 1, 2, 8),
+            for_loop_var(VarKind::ForCtl, 2, 2, 8),
+            named_local(3, "k", 3, 7),
+            named_local(4, "v", 3, 7),
+        ]
+    }
+
+    /// Build a Stage-17-part-2 module mirroring
+    /// `for k, v in pairs(t) do print(k, v) end`.
+    ///
+    /// Bytecode (abs idx → real idx):
+    ///   1 GGET 0 0      real-idx 0  (load pairs)
+    ///   2 GGET 2 1      real-idx 1  (load t)
+    ///   3 CALL 0 4 2    real-idx 2  (call pairs(t), 3 results at 0..2)
+    ///   4 ISNEXT 3 => 9 real-idx 3  (A=3; k at 3, v at 4)
+    ///   5 GGET 5 2      real-idx 4  (body: load print)
+    ///   6 MOV 7 3       real-idx 5  (copy k)
+    ///   7 MOV 8 4       real-idx 6  (copy v)
+    ///   8 CALL 5 1 3    real-idx 7  (print(k, v))
+    ///   9 ITERN 3 3 3   real-idx 8  (latch prefix: advance iterator)
+    ///  10 ITERL 3 => 5  real-idx 9  (latch: back-edge to body)
+    ///  11 RET0 0 1      real-idx 10 (exit)
+    ///
+    /// Caller supplies the var_info records so individual tests can
+    /// vary them (e.g., test the missing-name NotImplemented path).
+    fn generic_for_module(var_info: Vec<VarInfo>) -> Module {
+        // ISNEXT at abs idx 4 → target abs idx 9. j = 9 - 5 = 4, D = 0x8004.
+        // ITERL at abs idx 10 → target abs idx 5. j = 5 - 11 = -6, D = 0x7FFA.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Gget, 2, 1),
+            abc(Opcode::Call, 0, 4, 2),
+            ad(Opcode::Isnext, 3, 0x8004),
+            ad(Opcode::Gget, 5, 2),
+            ad(Opcode::Mov, 7, 3),
+            ad(Opcode::Mov, 8, 4),
+            abc(Opcode::Call, 5, 1, 3),
+            abc(Opcode::Itern, 3, 3, 3),
+            ad(Opcode::Iterl, 3, 0x7FFA),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        module_with(
+            insts,
+            var_info,
+            // gc_consts are reverse-indexed: GGET 0 0 → gc_consts[2],
+            // GGET 2 1 → gc_consts[1], GGET 5 2 → gc_consts[0]. So
+            // file order is [print, t, pairs].
+            vec![
+                GcConst::Str(b"print".to_vec()),
+                GcConst::Str(b"t".to_vec()),
+                GcConst::Str(b"pairs".to_vec()),
+            ],
+            Vec::new(),
+            9,
+        )
+    }
+
+    /// `for k, v in pairs(t) do print(k, v) end` → emits the
+    /// canonical source through the full pipeline.
+    #[test]
+    fn recover_generic_for_two_vars() {
+        let module = generic_for_module(generic_for_var_info());
+        assert_eq!(
+            emit(&module),
+            "for k, v in pairs(t) do\n    print(k, v)\nend"
+        );
+    }
+
+    /// Same fixture recovered directly to AST. Verifies the
+    /// `Stmt::ForIn` tree shape: vars [k, v], iterator is the call
+    /// `pairs(t)`, body is a bare call to `print(k, v)`.
+    #[test]
+    fn recover_generic_for_ast_shape() {
+        let module = generic_for_module(generic_for_var_info());
+        let proto = module.main_proto();
+        let cfg = Cfg::build(proto);
+        let ast = recover(&module, 0, &cfg, true, None).expect("recover should succeed");
+
+        assert_eq!(ast.len(), 1, "expected just [ForIn] (implicit RET0)");
+        match &ast[0] {
+            Stmt::ForIn {
+                vars,
+                iterator,
+                body,
+            } => {
+                assert_eq!(vars, &vec!["k".to_string(), "v".to_string()]);
+                match iterator {
+                    Expr::Call { func, args } => {
+                        assert_eq!(*func.as_ref(), Expr::Global("pairs".to_string()));
+                        assert_eq!(args.len(), 1, "iterator call args len");
+                        assert_eq!(args[0], Expr::Global("t".to_string()));
+                    }
+                    other => panic!("expected Call iterator, got {:?}", other),
+                }
+                assert_eq!(body.len(), 1, "body len");
+                match &body[0] {
+                    Stmt::Call { func, args } => {
+                        assert_eq!(*func, Expr::Global("print".to_string()));
+                        assert_eq!(
+                            args,
+                            &vec![Expr::Var("k".to_string()), Expr::Var("v".to_string())]
+                        );
+                    }
+                    other => panic!("expected Call body stmt, got {:?}", other),
+                }
+            }
+            other => panic!("expected ForIn, got {:?}", other),
+        }
+    }
+
+    /// Single-variable generic-for: `for k in pairs(t) do print(k) end`.
+    /// Verifies the loop-variable walk stops at the first unnamed slot
+    /// (slot 4 has no Name record, so vars == [k]).
+    #[test]
+    fn recover_generic_for_single_var() {
+        // Same shape as two-vars, but ITERN B=2 (single loop var) and
+        // the body's print(k) only reads slot 3. Layout (one fewer
+        // body instruction than the two-vars case):
+        //   1 GGET 0 0; 2 GGET 2 1; 3 CALL 0 4 2; 4 ISNEXT 3 => 8;
+        //   5 GGET 4 2; 6 MOV 6 3; 7 CALL 4 1 2;
+        //   8 ITERN 3 2 3; 9 ITERL 3 => 5;
+        //  10 RET0.
+        // D encodings:
+        //   ISNEXT idx 4 → target idx 8:  j = 8-5 = 3,   D = 0x8003.
+        //   ITERL  idx 9 → target idx 5:  j = 5-10 = -5, D = 0x7FFB.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Gget, 2, 1),
+            abc(Opcode::Call, 0, 4, 2),
+            ad(Opcode::Isnext, 3, 0x8003),
+            ad(Opcode::Gget, 4, 2),
+            ad(Opcode::Mov, 6, 3),
+            abc(Opcode::Call, 4, 1, 2),
+            abc(Opcode::Itern, 3, 2, 3),
+            ad(Opcode::Iterl, 3, 0x7FFB),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let var_info = vec![
+            for_loop_var(VarKind::ForGen, 0, 2, 7),
+            for_loop_var(VarKind::ForState, 1, 2, 7),
+            for_loop_var(VarKind::ForCtl, 2, 2, 7),
+            // Only k (slot 3) is named — slot 4 has no Name record.
+            named_local(3, "k", 3, 6),
+        ];
+        let module = module_with(
+            insts,
+            var_info,
+            // gc_consts reverse-indexed: file order [print, t, pairs].
+            vec![
+                GcConst::Str(b"print".to_vec()),
+                GcConst::Str(b"t".to_vec()),
+                GcConst::Str(b"pairs".to_vec()),
+            ],
+            Vec::new(),
+            7,
+        );
+        assert_eq!(emit(&module), "for k in pairs(t) do\n    print(k)\nend");
+    }
+
+    /// A generic-for whose loop variables lack Name records bails
+    /// with NotImplemented (we can't reconstruct names from a
+    /// stripped proto).
+    #[test]
+    fn recover_generic_for_bails_when_var_names_missing() {
+        // Iterator-state records only — no Name records for slots 3+.
+        let var_info = vec![
+            for_loop_var(VarKind::ForGen, 0, 2, 8),
+            for_loop_var(VarKind::ForState, 1, 2, 8),
+            for_loop_var(VarKind::ForCtl, 2, 2, 8),
+        ];
+        let module = generic_for_module(var_info);
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented when loop var names are missing, got {:?}",
+            result
+        );
+    }
+
+    /// A generic-for inside an `if` body bails with NotImplemented
+    /// (Stage 17 part 2 doesn't support nested loops in branches).
+    #[test]
+    fn recover_generic_for_in_branch_body_bails() {
+        // Outer if/then wrapping an inner generic-for. The walk
+        // enters the then-body with stop_at_merge=true; the LoopInit
+        // arm rejects that immediately.
+        //   GGET 0 0; ISF 0; JMP => 0013;  (entry / outer CB)
+        //   GGET 1 0; GGET 3 1; CALL 1 4 2;  (pairs(t) setup)
+        //   ISNEXT 4 => 0012;
+        //   GGET 6 2; MOV 8 4; MOV 9 5; CALL 6 1 3;  (body)
+        //   ITERN 4 3 3; ITERL 4 => 0007;
+        //   RET0.  (inner exit, == outer merge since then-body falls through)
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),        // idx 1
+            ad(Opcode::Isf, 0, 0),         // idx 2
+            ad(Opcode::Jmp, 1, 0x8009),    // idx 3: target = idx 13
+            ad(Opcode::Gget, 1, 0),        // idx 4 — pairs
+            ad(Opcode::Gget, 3, 1),        // idx 5 — t
+            abc(Opcode::Call, 1, 4, 2),    // idx 6 — pairs(t)
+            ad(Opcode::Isnext, 4, 0x8005), // idx 7 — target = idx 13 (latch)
+            ad(Opcode::Gget, 6, 2),        // idx 8 — body: print
+            ad(Opcode::Mov, 8, 4),         // idx 9
+            ad(Opcode::Mov, 9, 5),         // idx 10
+            abc(Opcode::Call, 6, 1, 3),    // idx 11
+            abc(Opcode::Itern, 4, 3, 3),   // idx 12 — latch prefix
+            ad(Opcode::Iterl, 4, 0x7FF8),  // idx 13 — latch: target = idx 7
+            ad(Opcode::Ret0, 0, 1),        // idx 14 — exit
+        ];
+        let module = module_with(
+            insts,
+            vec![
+                for_loop_var(VarKind::ForGen, 1, 5, 11),
+                for_loop_var(VarKind::ForState, 2, 5, 11),
+                for_loop_var(VarKind::ForCtl, 3, 5, 11),
+                named_local(4, "k", 6, 10),
+                named_local(5, "v", 6, 10),
+            ],
+            // gc_consts reverse-indexed. GGET operands in the fixture:
+            //   GGET 0 0 → "x"        (file idx 3)
+            //   GGET 1 0 → "pairs"    (file idx 2)
+            //   GGET 3 1 → "t"        (file idx 1)
+            //   GGET 6 2 → "print"    (file idx 0)
+            // So file order is [print, t, pairs, x].
+            vec![
+                GcConst::Str(b"print".to_vec()),
+                GcConst::Str(b"t".to_vec()),
+                GcConst::Str(b"pairs".to_vec()),
+                GcConst::Str(b"x".to_vec()),
+            ],
+            Vec::new(),
+            10,
+        );
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for generic-for in if-body, got {:?}",
             result
         );
     }
@@ -7726,6 +8187,111 @@ mod tests {
             3,
         );
         assert_eq!(emit(&module), "local x = print(f())\nreturn x");
+    }
+
+    /// `obj:m(f())` — CALLM with method-call detection (Stage 17
+    /// part 2). The compiler emits:
+    ///   GGET 0 0      ; obj at slot 0
+    ///   MOV 2 0       ; self = obj at slot 2 (FR2 gap at slot 1)
+    ///   TGETS 0 0 1   ; slot 0 = obj.m
+    ///   GGET 3 2      ; f at slot 3
+    ///   CALL 3 0 1    ; call f() → multres at slot 3
+    ///   CALLM 0 1 1   ; call obj.m(self, f()) with C=1 (self fixed arg)
+    ///   RET0 0 1.
+    /// C=1 (not 0) because the self slot counts as a fixed arg;
+    /// the multres trails at slot arg_base+C = 2+1 = 3.
+    #[test]
+    fn recover_callm_method_call_multres() {
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),      // idx 1 — obj
+            ad(Opcode::Mov, 2, 0),       // idx 2 — self = obj
+            abc(Opcode::Tgets, 0, 0, 1), // idx 3 — slot 0 = obj.m
+            ad(Opcode::Gget, 3, 2),      // idx 4 — f at slot 3
+            abc(Opcode::Call, 3, 0, 1),  // idx 5 — f() multres at slot 3
+            abc(Opcode::Callm, 0, 1, 1), // idx 6 — obj:m(f())
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            // gc_consts reverse-indexed: TGETS C=1 → gc_consts[1] = "m";
+            // GGET 0 0 → gc_consts[2] = "obj"; GGET 3 2 → gc_consts[0] = "f".
+            // File order [f, m, obj].
+            vec![
+                GcConst::Str(b"f".to_vec()),
+                GcConst::Str(b"m".to_vec()),
+                GcConst::Str(b"obj".to_vec()),
+            ],
+            Vec::new(),
+            4,
+        );
+        assert_eq!(emit(&module), "obj:m(f())");
+    }
+
+    /// `obj:m(1, f())` — CALLM method-call with both a fixed
+    /// explicit arg (the literal `1`) and trailing multres. Verifies
+    /// the multres-slot math: arg_base + C.
+    #[test]
+    fn recover_callm_method_call_fixed_plus_multres() {
+        //   GGET 0 0      ; obj
+        //   MOV 2 0       ; self = obj
+        //   TGETS 0 0 1   ; slot 0 = obj.m
+        //   KSHORT 3 1    ; arg 1 (literal 1) at slot 3
+        //   GGET 4 2      ; f at slot 4
+        //   CALL 4 0 1    ; f() multres at slot 4
+        //   CALLM 0 1 2   ; obj:m(1, f()) with C=2 (self + 1 fixed)
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Mov, 2, 0),
+            abc(Opcode::Tgets, 0, 0, 1),
+            ad(Opcode::Kshort, 3, 1),
+            ad(Opcode::Gget, 4, 2),
+            abc(Opcode::Call, 4, 0, 1),
+            abc(Opcode::Callm, 0, 1, 2),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            // TGETS C=1 → gc_consts[1] = "m"; GGET 0 0 → gc_consts[2] = "obj";
+            // GGET 4 2 → gc_consts[0] = "f". File order [f, m, obj].
+            vec![
+                GcConst::Str(b"f".to_vec()),
+                GcConst::Str(b"m".to_vec()),
+                GcConst::Str(b"obj".to_vec()),
+            ],
+            Vec::new(),
+            5,
+        );
+        assert_eq!(emit(&module), "obj:m(1, f())");
+    }
+
+    /// `local r = obj:m(f()); return r` — CALLM method-call with a
+    /// single result (B=2). Verifies route_call_result emits a
+    /// LocalDecl with the MethodCall expr.
+    #[test]
+    fn recover_callm_method_call_single_result() {
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),      // obj
+            ad(Opcode::Mov, 2, 0),       // self = obj
+            abc(Opcode::Tgets, 0, 0, 1), // slot 0 = obj.m
+            ad(Opcode::Gget, 3, 2),      // f at slot 3
+            abc(Opcode::Call, 3, 0, 1),  // f() multres at slot 3
+            abc(Opcode::Callm, 0, 2, 1), // obj:m(f()), 1 result at slot 0
+            ad(Opcode::Ret1, 0, 2),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "r", 5, 6)],
+            vec![
+                GcConst::Str(b"f".to_vec()),
+                GcConst::Str(b"m".to_vec()),
+                GcConst::Str(b"obj".to_vec()),
+            ],
+            Vec::new(),
+            4,
+        );
+        assert_eq!(emit(&module), "local r = obj:m(f())\nreturn r");
     }
 
     // ---- CALLT (tail call via Terminator::TailCall) ----------------
