@@ -108,29 +108,47 @@ pub enum Terminator {
     /// Tail call (CALLT, CALLMT) — treated as a return for CFG
     /// purposes. The payload is the CALLT/CALLMT instruction's index.
     TailCall(InstructionId),
-    /// Numeric-for loop initializer (FORI; Stage 10). Initializes the
-    /// loop index slot (A+3) from the start/stop/step values in slots
-    /// A, A+1, A+2. If the loop body would NOT execute (e.g. start >
-    /// stop with positive step), jumps to `exit`; otherwise falls
-    /// through to `body`. Modeled as a conditional branch: the
-    /// true_edge (jump) is `exit`, the false_edge (fall-through) is
-    /// `body`.
+    /// Numeric-for loop initializer (FORI; Stage 10) or generic-for
+    /// loop initializer (ISNEXT; Stage 17 part 2). Initializes the
+    /// loop index slot (numeric-for: A+3) or the loop variables
+    /// (generic-for: A, A+1, …) from the values set up by the
+    /// preceding instructions. If the loop body would NOT execute
+    /// (e.g. start > stop with positive step, or an empty iterator),
+    /// jumps to `exit`; otherwise falls through to `body`. Modeled
+    /// as a conditional branch: the true_edge (jump) is `exit`, the
+    /// false_edge (fall-through) is `body`.
+    ///
+    /// For FORI, `base` slots A..=A+3 hold start, stop, step, and
+    /// the loop index. For ISNEXT, `base` is the first loop variable
+    /// slot (k at A, v at A+1); iterator state occupies A-3..A-1.
+    /// The recovery distinguishes the two by re-reading the opcode
+    /// at the block's terminator index.
+    ///
+    /// Note: for ISNEXT the `exit` block is empirically the latch
+    /// block (containing ITERN + ITERL), not the real loop exit;
+    /// ISNEXT's D target lands at ITERN so the empty-iterator case
+    /// funnels through ITERL's fall-through. The recovery skips the
+    /// latch by reading the LoopLatch's own `exit` when continuing
+    /// past a generic-for.
     LoopInit {
-        /// The FORI's base slot A. Slots A..=A+3 hold start, stop,
-        /// step, and the loop index respectively.
+        /// The FORI/ISNEXT base slot A. FORI: start/stop/step base;
+        /// ISNEXT: first loop variable slot.
         base: u8,
         /// Jump target (loop body empty) — the loop exit.
         exit: BlockId,
         /// Fall-through target — the loop body start.
         body: BlockId,
     },
-    /// Numeric-for loop latch (FORL; Stage 10). Increments the loop
-    /// index by step. If the loop should continue, jumps back to
+    /// Numeric-for loop latch (FORL; Stage 10) or generic-for loop
+    /// latch (ITERL; Stage 17 part 2). Increments the loop index
+    /// (FORL) or advances the iterator (ITERN, which precedes ITERL
+    /// in its block). If the loop should continue, jumps back to
     /// `body` (the back-edge); otherwise falls through to `exit`.
-    /// Modeled as a conditional branch: the true_edge (backward jump)
-    /// is `body`, the false_edge (fall-through) is `exit`.
+    /// Modeled as a conditional branch: the true_edge (backward
+    /// jump) is `body`, the false_edge (fall-through) is `exit`.
     LoopLatch {
-        /// The FORL's base slot A (matches the paired FORI's base).
+        /// The FORL/ITERL base slot A (matches the paired FORI/ISNEXT
+        /// base).
         base: u8,
         /// Backward jump target — the loop body start.
         body: BlockId,
@@ -262,14 +280,31 @@ impl Cfg {
                 if i + 1 < n {
                     leaders.insert(i + 1);
                 }
-            } else if op == Opcode::Fori || op == Opcode::Forl {
-                // FORI/FORL: like JMP, their D-field target is a
-                // leader, and the instruction after them is a leader
-                // (the fall-through edge). For FORI the D target is
-                // the loop exit and the fall-through is the body; for
-                // FORL the D target is the body (back-edge) and the
-                // fall-through is the exit. Both end a block: the
-                // FORI/FORL instruction is the block's terminator.
+            } else if op == Opcode::Fori
+                || op == Opcode::Forl
+                || op == Opcode::Isnext
+                || op == Opcode::Iterl
+            {
+                // FORI/FORL (numeric-for, Stage 10) and ISNEXT/ITERL
+                // (generic-for, Stage 17 part 2): like JMP, their
+                // D-field target is a leader, and the instruction
+                // after them is a leader (the fall-through edge). For
+                // FORI the D target is the loop exit and the
+                // fall-through is the body; for FORL the D target is
+                // the body (back-edge) and the fall-through is the
+                // exit. ISNEXT mirrors FORI's edge layout (exit jump
+                // + body fall-through), and ITERL mirrors FORL's
+                // (body back-edge + exit fall-through). All four end
+                // a block: the instruction itself is the block's
+                // terminator.
+                //
+                // Note on ISNEXT's exit target: empirically (verified
+                // via `luajit -bl`) ISNEXT's D target points at the
+                // ITERN instruction — the *latch* block — rather than
+                // past ITERL. The latch then falls through to the
+                // real exit when the iterator is empty. The recovery
+                // accounts for this by skipping the latch when
+                // continuing past a generic-for loop.
                 if let Some(target) = Self::jmp_target(proto, i) {
                     leaders.insert(target);
                 }
@@ -534,15 +569,24 @@ impl Cfg {
                 Terminator::TailCall(InstructionId(last_inst_idx.unwrap() as u32)),
                 Vec::new(),
             ),
-            Some(Opcode::Fori) => {
-                // FORI A D: initializes the loop and conditionally
-                // jumps to the exit (D target). The fall-through is
-                // the loop body. Modeled as a conditional branch:
-                // true_edge (jump) = exit, false_edge (fall-through)
-                // = body.
-                let fori_idx = last_inst_idx.unwrap();
-                let base = proto.insts[fori_idx].a;
-                let exit = Self::jmp_target(proto, fori_idx)
+            Some(Opcode::Fori) | Some(Opcode::Isnext) => {
+                // FORI A D (numeric-for, Stage 10) and ISNEXT A D
+                // (generic-for, Stage 17 part 2): initialize the loop
+                // and conditionally jump to the exit (D target). The
+                // fall-through is the loop body. Modeled as a
+                // conditional branch: true_edge (jump) = exit,
+                // false_edge (fall-through) = body.
+                //
+                // The `base` operand carries different meanings:
+                //   - FORI: A is the start/stop/step slot base
+                //     (loop index at A+3).
+                //   - ISNEXT: A is the first loop variable (k at A,
+                //     v at A+1); iterator state is at A-3..A-1.
+                // The recovery distinguishes by re-reading the
+                // opcode at the block's terminator index.
+                let init_idx = last_inst_idx.unwrap();
+                let base = proto.insts[init_idx].a;
+                let exit = Self::jmp_target(proto, init_idx)
                     .and_then(|t| leader_to_block.get(&t).copied());
                 let body = next_block_id;
                 match (exit, body) {
@@ -556,15 +600,16 @@ impl Cfg {
                     _ => (Terminator::Return, Vec::new()),
                 }
             }
-            Some(Opcode::Forl) => {
-                // FORL A D: increments the index and conditionally
-                // jumps back to the body (D target). The fall-through
-                // is the loop exit. Modeled as a conditional branch:
-                // true_edge (backward jump) = body, false_edge
-                // (fall-through) = exit.
-                let forl_idx = last_inst_idx.unwrap();
-                let base = proto.insts[forl_idx].a;
-                let body = Self::jmp_target(proto, forl_idx)
+            Some(Opcode::Forl) | Some(Opcode::Iterl) => {
+                // FORL A D (numeric-for, Stage 10) and ITERL A D
+                // (generic-for, Stage 17 part 2): the loop latch.
+                // Conditionally jumps back to the body (D target);
+                // the fall-through is the loop exit. Modeled as a
+                // conditional branch: true_edge (backward jump) =
+                // body, false_edge (fall-through) = exit.
+                let latch_idx = last_inst_idx.unwrap();
+                let base = proto.insts[latch_idx].a;
+                let body = Self::jmp_target(proto, latch_idx)
                     .and_then(|t| leader_to_block.get(&t).copied());
                 let exit = next_block_id;
                 match (body, exit) {
@@ -709,6 +754,17 @@ mod tests {
             a,
             b_or_d: u32::from(d),
             c: 0,
+        }
+    }
+
+    /// Build an ABC-format instruction. Used by the Stage 17 part 2
+    /// generic-for tests (CALL/ITERN are ABC opcodes).
+    fn abc(op: Opcode, a: u8, b: u8, c: u8) -> Instruction {
+        Instruction {
+            op,
+            a,
+            b_or_d: u32::from(b),
+            c,
         }
     }
 
@@ -1637,5 +1693,162 @@ mod tests {
         ]);
         assert_eq!(Cfg::jmp_target(&proto, 4), Some(7), "FORI D=0x8002 → idx 7");
         assert_eq!(Cfg::jmp_target(&proto, 6), Some(5), "FORL D=0x7ffe → idx 5");
+    }
+
+    // ====================================================================
+    // Stage 17 part 2: generic-for (ISNEXT/ITERN/ITERL) CFG tests
+    // ====================================================================
+
+    // Source: `for k, v in pairs(t) do print(k, v) end`. Bytecode
+    // (from `luajit -bl`):
+    //   GGET 0 0     ; pairs
+    //   GGET 2 1     ; t
+    //   CALL 0 4 2   ; pairs(t) → 3 results at slots 0..2
+    //   ISNEXT 3 => 0009   ; A=3 (k at 3, v at 4); exit target = idx 9
+    //   GGET 5 2     ; body: print
+    //   MOV 7 3      ; copy k
+    //   MOV 8 4      ; copy v
+    //   CALL 5 1 3   ; print(k, v)
+    //   ITERN 3 3 3  ; idx 9: advance iterator
+    //   ITERL 3 => 0005  ; idx 10: latch, back-edge to body
+    //   RET0 0 1     ; idx 11
+    //
+    // ISNEXT at idx 4 with target=9: D = 4+1+j=9 → j=4 → D=0x8004.
+    // ITERL at idx 10 with target=5: j = 5-10-1 = -6 → D=0x8000-6 = 0x7FFA.
+    #[test]
+    fn isnext_itern_iterl_produce_loop_init_and_latch_blocks() {
+        let proto = proto_with_real_insts(vec![
+            ad(Opcode::Gget, 0, 0),        // idx 1
+            ad(Opcode::Gget, 2, 1),        // idx 2
+            abc(Opcode::Call, 0, 4, 2),    // idx 3 — CALL is ABC
+            ad(Opcode::Isnext, 3, 0x8004), // idx 4 — ISNEXT: target = idx 9
+            ad(Opcode::Gget, 5, 2),        // idx 5 — body
+            ad(Opcode::Mov, 7, 3),         // idx 6
+            ad(Opcode::Mov, 8, 4),         // idx 7
+            abc(Opcode::Call, 5, 1, 3),    // idx 8
+            abc(Opcode::Itern, 3, 3, 3),   // idx 9 — latch prefix
+            ad(Opcode::Iterl, 3, 0x7FFA),  // idx 10 — ITERL: target = idx 5
+            ad(Opcode::Ret0, 0, 1),        // idx 11 — exit
+        ]);
+        let cfg = Cfg::build(&proto);
+
+        // Leaders: {1 (entry), 5 (after ISNEXT = body),
+        // 9 (ISNEXT exit target), 5 (ITERL target — already a leader),
+        // 11 (after ITERL = exit)}.
+        // 4 blocks: pre-loop [1,2,3,4], body [5,6,7,8],
+        // latch [9,10], exit [11].
+        assert_eq!(
+            cfg.blocks.len(),
+            4,
+            "expected pre-loop + body + latch + exit"
+        );
+        assert_block_id(cfg.entry, 0);
+
+        // Block 0 (pre-loop + ISNEXT): 4 insts → LoopInit.
+        let pre_loop = &cfg.blocks[0];
+        assert_eq!(
+            pre_loop.insts,
+            vec![
+                InstructionId(1),
+                InstructionId(2),
+                InstructionId(3),
+                InstructionId(4)
+            ]
+        );
+        match &pre_loop.terminator {
+            Terminator::LoopInit { base, exit, body } => {
+                assert_eq!(*base, 3, "ISNEXT base = first loop var slot");
+                // ISNEXT's D target is idx 9 (the latch block, NOT
+                // the real exit). The recovery accounts for this by
+                // advancing to LoopLatch.exit when continuing past
+                // the loop.
+                assert_block_id(*exit, 2);
+                assert_block_id(*body, 1);
+            }
+            other => panic!("expected LoopInit, got {:?}", other),
+        }
+        assert_eq!(
+            pre_loop.succs,
+            vec![(BlockId(2), EdgeKind::True), (BlockId(1), EdgeKind::False)]
+        );
+
+        // Block 1 (body): 4 insts, ends in CALL → Fallthrough to latch.
+        let body = &cfg.blocks[1];
+        assert_eq!(
+            body.insts,
+            vec![
+                InstructionId(5),
+                InstructionId(6),
+                InstructionId(7),
+                InstructionId(8)
+            ]
+        );
+        match &body.terminator {
+            Terminator::Fallthrough(target) => assert_block_id(*target, 2),
+            other => panic!("expected Fallthrough, got {:?}", other),
+        }
+        // Body has two preds: pre-loop (via ISNEXT fall-through) and
+        // latch (via ITERL back-edge).
+        assert_eq!(body.preds, vec![BlockId(0), BlockId(2)]);
+
+        // Block 2 (latch): [ITERN, ITERL] → LoopLatch. The ITERN is
+        // a regular instruction inside the latch block (NOT a
+        // terminator). It's transparent for recovery.
+        let latch = &cfg.blocks[2];
+        assert_eq!(latch.insts, vec![InstructionId(9), InstructionId(10)]);
+        match &latch.terminator {
+            Terminator::LoopLatch { base, body, exit } => {
+                assert_eq!(*base, 3, "ITERL base");
+                assert_block_id(*body, 1);
+                assert_block_id(*exit, 3);
+            }
+            other => panic!("expected LoopLatch, got {:?}", other),
+        }
+        // Latch has two preds: pre-loop (via ISNEXT exit — empty
+        // iterator case) and body (via fallthrough).
+        assert_eq!(latch.preds, vec![BlockId(0), BlockId(1)]);
+
+        // Block 3 (exit): [RET0] → Return.
+        let exit_block = &cfg.blocks[3];
+        assert_eq!(exit_block.insts, vec![InstructionId(11)]);
+        assert!(matches!(exit_block.terminator, Terminator::Return));
+        assert!(exit_block.succs.is_empty());
+        // Exit has one pred: the latch (via ITERL fall-through when
+        // the iterator is exhausted).
+        assert_eq!(exit_block.preds, vec![BlockId(2)]);
+    }
+
+    // Direct verification of the ISNEXT/ITERL D encoding. Mirrors
+    // fori_forl_d_encoding_matches_jmp_formula: pins the empirical D
+    // values from `luajit -bl` so a regression in the encoding math
+    // for the generic-for opcodes is caught at the formula level.
+    #[test]
+    fn isnext_iterl_d_encoding_matches_jmp_formula() {
+        // ISNEXT at idx 4, D=0x8004 → target = 4 + 1 + (0x8004 - 0x8000) = 9.
+        // ITERL at idx 10, D=0x7FFA → target = 10 + 1 + (0x7FFA - 0x8000)
+        //                                  = 10 + 1 + (-6) = 5.
+        let proto = proto_with_real_insts(vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Gget, 2, 1),
+            abc(Opcode::Call, 0, 4, 2),
+            ad(Opcode::Isnext, 3, 0x8004), // idx 4
+            ad(Opcode::Gget, 5, 2),
+            ad(Opcode::Mov, 7, 3),
+            ad(Opcode::Mov, 8, 4),
+            abc(Opcode::Call, 5, 1, 3),
+            abc(Opcode::Itern, 3, 3, 3),
+            ad(Opcode::Iterl, 3, 0x7FFA), // idx 10
+            ad(Opcode::Ret0, 0, 1),
+        ]);
+        assert_eq!(
+            Cfg::jmp_target(&proto, 4),
+            Some(9),
+            "ISNEXT D=0x8004 → idx 9"
+        );
+        assert_eq!(
+            Cfg::jmp_target(&proto, 10),
+            Some(5),
+            "ITERL D=0x7FFA → idx 5"
+        );
     }
 }
