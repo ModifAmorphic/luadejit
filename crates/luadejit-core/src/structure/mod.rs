@@ -33,7 +33,7 @@
 //! `f(1, 2)`, `local x = tostring(42)`). The recovery handles CALL
 //! with zero or one explicit results and a fixed (non-multres)
 //! argument list. Tail calls (CALLT/CALLMT) remain CFG-terminator
-//! bailouts; method calls (Stage 13) and multres (Stage 15) are
+//! bailouts; method calls (Stage 13) and multres (Stage 16) are
 //! deferred.
 //!
 //! **Stage 13** adds field access (`obj.field`, `obj[5]`, `t[k]`)
@@ -55,7 +55,7 @@
 //! or TSETV — register key). The operand order is reversed from
 //! TGET*: TSET* has A = value, B = table, C = key, whereas TGET*
 //! has A = destination, B = table, C = key. TSETM (multres table
-//! population for `{f()}`) is deferred to Stage 15.
+//! population for `{f()}`) is deferred to Stage 17.
 //!
 //! **Stage 15** adds function literals (FNEW), the length operator
 //! (LEN), and global assignment (GSET). FNEW resolves the child proto
@@ -69,6 +69,17 @@
 //! deferred to later stages. LEN lowers to [`Expr::Len`]; GSET reuses
 //! [`Stmt::Assign`] (a global write is `name = value` at the source
 //! level).
+//!
+//! **Stage 16** adds multres support: multi-return locals
+//! (`local a, b, c = f()` via CALL with B > 2), tail calls
+//! (`return f(args)` via CALLT/CALLMT), varargs (`local x = ...` and
+//! `return ...` via VARG), multres returns (`return f()` and
+//! `return ...` via RETM), and multres call args (`print(f())` via
+//! CALLM). The CALL handler gains B == 0 (store the call expr for a
+//! later RETM/CALLM consumer) and B > 2 (multi-name local declaration
+//! when every result slot is a fresh local); FNEW appends `...` to
+//! the parameter list when the child proto carries `PROTO_VARARG`;
+//! the `Terminator::TailCall` arm lowers to `Stmt::Return(Some(Expr::Call))`.
 //!
 //! **Stage 11** adds `while cond do … end` and `repeat … until cond`
 //! support. Both are detected at the [`ConditionalBranch`] arm of
@@ -183,6 +194,16 @@ pub enum Stmt {
     /// in by separate `TableSet` statements, matching the bytecode
     /// shape LuaJIT emits for `local t = {}; t.x = 1`.
     TableSet { target: Expr, value: Expr },
+    /// `local a, b, c = expr` — multi-name local declaration (Stage
+    /// 16). Lowered from a `CALL A B C` with `B > 2` (B-1 results)
+    /// where every result slot A..A+B-2 is the declaration point of
+    /// a named local. The single RHS expression is typically an
+    /// [`Expr::Call`] (`local a, b, c = f()`); the call's multres
+    /// semantics fill the remaining names. When the slot assignments
+    /// aren't all declarations (mixed local/temp), the recovery bails
+    /// with [`DecompilerError::NotImplemented`] rather than producing
+    /// a partial shape.
+    LocalDeclMulti { names: Vec<String>, expr: Expr },
 }
 
 /// A Lua expression. Stage 7's variants cover the values Stages 1-6
@@ -295,6 +316,13 @@ pub enum Expr {
         params: Vec<String>,
         body: Vec<Stmt>,
     },
+    /// The vararg expression `...` (Stage 16). Lowered from a `VARG`
+    /// instruction. In a multres context (VARG with B=0) the
+    /// expression represents all vararg values and is consumed by a
+    /// following RETM (`return ...`) or CALLM. In a fixed-count
+    /// context (VARG with B=2) it represents the single first
+    /// vararg value, as in `local x = ...`.
+    Vararg,
 }
 
 /// A table entry in a table literal (Stage 14).
@@ -904,9 +932,45 @@ fn recover_from(
                 });
                 current = Some(merge);
             }
-            Terminator::TailCall(_) => {
-                // Tail calls aren't supported.
-                return Err(DecompilerError::NotImplemented);
+            Terminator::TailCall(tailcall_id) => {
+                // CALLT/CALLMT — tail call. Stage 16 lowers these to
+                // `return f(args)`: same control-flow effect (the
+                // current frame is replaced by the callee), expressible
+                // as a return of a call expression. Process the block's
+                // prefix instructions (everything except the trailing
+                // CALLT), then resolve the call from the CALLT's
+                // operands.
+                let last_idx = block.insts.last().map(|id| id.0 as usize).unwrap();
+                for inst_id in &block.insts {
+                    if (inst_id.0 as usize) == last_idx {
+                        break;
+                    }
+                    process_inst(ctx, stmts, *inst_id)?;
+                }
+                let callt_inst = &ctx.proto.insts[tailcall_id.0 as usize];
+                let arg_base = if ctx.is_fr2 {
+                    callt_inst.a + 2
+                } else {
+                    callt_inst.a + 1
+                };
+                let func = lookup_operand(ctx.slot_exprs, callt_inst.a)?;
+                // D-1 args packed at arg_base..arg_base + (D-1). D=0
+                // would mean multres args (CALLMT shape), which
+                // Stage 16 doesn't model for tail calls — bail.
+                if callt_inst.d() == 0 {
+                    return Err(DecompilerError::NotImplemented);
+                }
+                let arg_count = (callt_inst.d() - 1) as usize;
+                let args_end = arg_base.saturating_add(arg_count as u8);
+                let mut args = Vec::with_capacity(arg_count);
+                for slot in arg_base..args_end {
+                    args.push(lookup_operand(ctx.slot_exprs, slot)?);
+                }
+                stmts.push(Stmt::Return(Some(Expr::Call {
+                    func: Box::new(func),
+                    args,
+                })));
+                break;
             }
             Terminator::LoopInit { base, exit, body } => {
                 // Numeric-for loop start. Process the prefix
@@ -1078,8 +1142,12 @@ fn branch_shape(
 ///
 /// `RET0` is the implicit end-of-chunk return (no Stmt emitted).
 /// `RET1 A D` with `D == 2` is the single-value return convention;
-/// the returned expression comes from `slot_exprs[A]`. Anything else
-/// (other RET variants, `RET1` with `D != 2`, or a missing slot
+/// the returned expression comes from `slot_exprs[A]`. `RETM A D`
+/// (Stage 16) returns the multres produced by the previous
+/// instruction; Stage 16 only models the common `D == 0` case
+/// (`return f()` or `return ...`), where slot A holds the previous
+/// CALL's/VARG's expression. Anything else (other RET variants,
+/// `RET1` with `D != 2`, `RETM` with `D != 0`, or a missing slot
 /// expression) bails with [`DecompilerError::NotImplemented`].
 fn process_return_inst(
     proto: &Proto,
@@ -1101,7 +1169,22 @@ fn process_return_inst(
             stmts.push(Stmt::Return(Some(expr)));
             Ok(())
         }
-        // RET/RETM (multi-value returns) aren't Stage 7 territory.
+        Opcode::Retm => {
+            // RETM A D: return multres values starting at slot A.
+            // D=0 means "all values from the previous instruction"
+            // (the common case — `return f()` or `return ...`).
+            // D>1 would be a fixed multres count (rare); deferred.
+            if inst.d() != 0 {
+                return Err(DecompilerError::NotImplemented);
+            }
+            let expr = slot_exprs
+                .get(&inst.a)
+                .cloned()
+                .ok_or(DecompilerError::NotImplemented)?;
+            stmts.push(Stmt::Return(Some(expr)));
+            Ok(())
+        }
+        // RET (multi-value return with explicit values) isn't handled.
         _ => Err(DecompilerError::NotImplemented),
     }
 }
@@ -1232,22 +1315,23 @@ fn process_inst(
             // verified) convention:
             //   - A     = base slot; function is at slot A.
             //   - B-1   = number of return values expected
-            //             (B == 0 means multres — Stage 15).
+            //             (B == 0 means multres — Stage 16).
             //   - C-1   = number of arguments (C == 0 means multres
-            //             call from a VARG/previous CALL — Stage 15).
+            //             call from a VARG/previous CALL — Stage 16's
+            //             CALLM opcode, not bare CALL).
             // Arguments occupy slots arg_base..=A+C where arg_base is
             // A+2 in FR2 (gap at A+1) or A+1 in FR1 (no gap). Results
             // overwrite slots starting at A.
             //
-            // Stage 12 only models the regular cases: zero or one
-            // explicit results, and a fixed (non-multres) argument
-            // list. Tail calls (CALLT/CALLMT) are CFG terminators
-            // handled in the recovery walk (they bail with
-            // NotImplemented); multres (Stage 15) is deferred. Stage
-            // 13 adds method-call detection: a CALL whose base slot
-            // holds `Expr::Field { obj, name }` and whose self slot
-            // (arg_base) holds `obj` desugars to `obj:name(args)`.
-            if inst.b() == 0 || inst.c == 0 {
+            // Stage 12 modeled the regular cases: zero or one explicit
+            // results, and a fixed (non-multres) argument list. Stage
+            // 13 added method-call detection. Stage 16 extends the
+            // result handling to multres (B == 0, results consumed by
+            // a later RETM/CALLM) and known multi-result decls
+            // (B > 2, `local a, b, c = f()`). Bare CALL with C == 0
+            // never appears in well-formed bytecode (CALLM is the
+            // multres-args opcode), so it still bails.
+            if inst.c == 0 {
                 return Err(DecompilerError::NotImplemented);
             }
             // FR1 (Darktide corpus) packs args at A+1; FR2 (system
@@ -1285,36 +1369,14 @@ fn process_inst(
                 for slot in (arg_base + 1)..explicit_end {
                     args.push(lookup_operand(ctx.slot_exprs, slot)?);
                 }
-                let result_count = inst.b() - 1;
-                match result_count {
-                    0 => {
-                        // Result discarded — emit a bare method call.
-                        stmts.push(Stmt::MethodCall { obj, method, args });
-                    }
-                    1 => {
-                        // Single result stored at slot A. Route
-                        // through assign_slot_ast so the destination
-                        // is recognized as `local x = obj:m(...)`,
-                        // `x = obj:m(...)`, or an unnamed temp.
-                        let call_expr = Expr::MethodCall {
-                            obj: Box::new(obj),
-                            method,
-                            args,
-                        };
-                        assign_slot_ast(
-                            ctx.proto,
-                            ctx.slot_exprs,
-                            stmts,
-                            inst.a,
-                            call_expr,
-                            real_idx,
-                        );
-                    }
-                    _ => {
-                        // Multiple return values — Stage 15.
-                        return Err(DecompilerError::NotImplemented);
-                    }
-                }
+                let call_expr = Expr::MethodCall {
+                    obj: Box::new(obj),
+                    method,
+                    args,
+                };
+                route_call_result(
+                    ctx, stmts, inst, real_idx, call_expr, /* method = */ true,
+                )?;
             } else {
                 // Regular call: C-1 args packed at
                 // `arg_base..arg_base + arg_count`.
@@ -1324,37 +1386,13 @@ fn process_inst(
                 for slot in arg_base..args_end {
                     args.push(lookup_operand(ctx.slot_exprs, slot)?);
                 }
-                let result_count = inst.b() - 1;
-                match result_count {
-                    0 => {
-                        // Result discarded — emit a bare call. No slot
-                        // update needed: nothing was stored.
-                        stmts.push(Stmt::Call { func, args });
-                    }
-                    1 => {
-                        // Single result stored at slot A. Route
-                        // through assign_slot_ast so the destination
-                        // is recognized as `local x = f(...)`,
-                        // `x = f(...)`, or an unnamed temp.
-                        let call_expr = Expr::Call {
-                            func: Box::new(func),
-                            args,
-                        };
-                        assign_slot_ast(
-                            ctx.proto,
-                            ctx.slot_exprs,
-                            stmts,
-                            inst.a,
-                            call_expr,
-                            real_idx,
-                        );
-                    }
-                    _ => {
-                        // Multiple return values (e.g.
-                        // `local a, b = f()`) — Stage 15.
-                        return Err(DecompilerError::NotImplemented);
-                    }
-                }
+                let call_expr = Expr::Call {
+                    func: Box::new(func),
+                    args,
+                };
+                route_call_result(
+                    ctx, stmts, inst, real_idx, call_expr, /* method = */ false,
+                )?;
             }
         }
         Opcode::Tgets => {
@@ -1512,6 +1550,11 @@ fn process_inst(
             // - upvalues (numuv > 0) — deferred to a later stage
             // - nested children (the child has its own children) —
             //   the simple-case index formula doesn't apply
+            //
+            // Stage 16 appends `...` to the parameter list when the
+            // child proto is vararg (`PROTO_VARARG` flag set), so
+            // `function(...) ... end` and `function(a, ...) ... end`
+            // round-trip with the vararg marker preserved.
             let child_idx = resolve_child_proto(ctx.module, ctx.proto_idx, inst.d())?;
             let child = &ctx.module.protos[child_idx];
             // Upvalue capture is out of scope for Stage 15.
@@ -1522,7 +1565,10 @@ fn process_inst(
             // slot_exprs / visited set is created inside recover.
             let child_cfg = Cfg::build(child);
             let body = recover(ctx.module, child_idx, &child_cfg, ctx.is_fr2)?;
-            let params = extract_params(child);
+            let mut params = extract_params(child);
+            if child.is_vararg() {
+                params.push("...".to_string());
+            }
             let func_expr = Expr::Function { params, body };
             assign_slot_ast(
                 ctx.proto,
@@ -1532,6 +1578,77 @@ fn process_inst(
                 func_expr,
                 real_idx,
             );
+        }
+        Opcode::Varg => {
+            // VARG A B D — load vararg values. A is the destination
+            // base slot; B-1 is the number of values copied (B == 0
+            // means multres — store `Expr::Vararg` for the consumer).
+            // Stage 16.
+            //
+            // For B == 0 (multres): store `Expr::Vararg` in slot A.
+            //   A following RETM reads it as `return ...`; a CALLM
+            //   reads it as the multres args of `f(...)`.
+            // For B >= 2 (one or more fixed results): the first
+            //   result lands at slot A. Stage 16 models the common
+            //   B == 2 case (`local x = ...`) by storing
+            //   `Expr::Vararg` in slot A via assign_slot_ast so the
+            //   declaration is recognized.
+            // For B > 2 (multiple fixed results): NotImplemented —
+            //   would need a multi-name declaration like
+            //   `local x, y = ...`, which is rare and not in any
+            //   fixture.
+            let result_count = if inst.b() == 0 {
+                usize::MAX
+            } else {
+                (inst.b() - 1) as usize
+            };
+            match result_count {
+                usize::MAX | 1 => {
+                    assign_slot_ast(
+                        ctx.proto,
+                        ctx.slot_exprs,
+                        stmts,
+                        inst.a,
+                        Expr::Vararg,
+                        real_idx,
+                    );
+                }
+                _ => return Err(DecompilerError::NotImplemented),
+            }
+        }
+        Opcode::Callm if inst.c == 0 => {
+            // CALLM A B C — call with multres args (Stage 16). Same
+            // shape as CALL but C == 0 means "use the multres
+            // produced by the previous CALL/VARG as the trailing
+            // args." LuaJIT emits this for `print(f())` (the inner
+            // call's results are the outer call's args).
+            //
+            // Known limitation: CALLM does NOT check for method-call
+            // detection (unlike CALL, which checks Field+self-slot).
+            // So `obj:m(f())` would emit as `obj.m(f())` with explicit
+            // self. This is out of scope for Stage 16.
+            // `f(...)` (the vararg's values are the args).
+            //
+            // Handling: when C == 0, the single multres arg lives at
+            // arg_base (same slot the previous CALL/VARG wrote its
+            // results into). Pull that expression and use it as the
+            // sole argument. When C > 0, the call has C-1 fixed args
+            // *plus* a trailing multres slot at arg_base + (C-1);
+            // Stage 16 doesn't model the mixed case — bail (falls
+            // through to the `_` arm).
+            //
+            // Result handling (B) is identical to CALL: route through
+            // route_call_result so multres (B == 0), bare call
+            // (B == 1), single result (B == 2), and LocalDeclMulti
+            // (B > 2) all work the same way.
+            let arg_base = if ctx.is_fr2 { inst.a + 2 } else { inst.a + 1 };
+            let func = lookup_operand(ctx.slot_exprs, inst.a)?;
+            let multres_arg = lookup_operand(ctx.slot_exprs, arg_base)?;
+            let call_expr = Expr::Call {
+                func: Box::new(func),
+                args: vec![multres_arg],
+            };
+            route_call_result(ctx, stmts, inst, real_idx, call_expr, false)?;
         }
         _ => return Err(DecompilerError::NotImplemented),
     }
@@ -1703,6 +1820,117 @@ fn assign_slot_ast(
     } else {
         slot_exprs.insert(slot, expr);
     }
+}
+
+/// Route a CALL/CALLM result according to its B operand. Shared by
+/// the regular-call and method-call paths so both opcodes gain
+/// Stage 16's multres (B == 0) and known-multi-result (B > 2)
+/// handling consistently.
+///
+/// Behavior by result count (B-1):
+///
+/// - **0 (multres, B == 0)**: store `call_expr` in slot A without
+///   emitting a Stmt. The consumer (RETM, CALLM, etc.) determines
+///   the count and pulls the expression from slot A. This is the
+///   `local a, b = f()` shape when the call feeds a multres
+///   consumer, or `return f()` when the next instruction is RETM.
+/// - **0 (B == 1)**: result discarded. Emit the call as a bare
+///   statement (`Stmt::Call` / `Stmt::MethodCall`).
+/// - **1 (B == 2)**: single result at slot A. Route through
+///   [`assign_slot_ast`] so the destination is recognized as
+///   `local x = f(...)`, `x = f(...)`, or an unnamed temp.
+/// - **>1 (B > 2)**: known multiple results. For regular calls
+///   (`method == false`), check that every result slot is the
+///   declaration point of a named local; if so emit
+///   [`Stmt::LocalDeclMulti`] (`local a, b, c = f()`). Mixed
+///   declaration/temp slots or method calls bail with
+///   [`DecompilerError::NotImplemented`] — those shapes don't have
+///   a clean Lua source representation.
+fn route_call_result(
+    ctx: &mut RecoveryCtx,
+    stmts: &mut Vec<Stmt>,
+    inst: &Instruction,
+    real_idx: usize,
+    call_expr: Expr,
+    method: bool,
+) -> Result<(), DecompilerError> {
+    let result_count = if inst.b() == 0 {
+        // B == 0: multres. Use a sentinel distinct from the named
+        // counts below; route to the multres arm.
+        usize::MAX
+    } else {
+        (inst.b() - 1) as usize
+    };
+    match result_count {
+        usize::MAX => {
+            // Multres — store the call expr in slot A for the next
+            // consumer (RETM/CALLM/etc.). No Stmt is emitted: the
+            // consumer determines how the multres is used.
+            ctx.slot_exprs.insert(inst.a, call_expr);
+        }
+        0 => {
+            // Result discarded — emit a bare call statement.
+            match call_expr {
+                Expr::Call { func, args } => stmts.push(Stmt::Call { func: *func, args }),
+                Expr::MethodCall { obj, method, args } => stmts.push(Stmt::MethodCall {
+                    obj: *obj,
+                    method,
+                    args,
+                }),
+                _ => unreachable!("route_call_result received non-call expr"),
+            }
+        }
+        1 => {
+            // Single result at slot A — route through assign_slot_ast
+            // so the destination is recognized as a declaration,
+            // reassignment, or unnamed temp.
+            assign_slot_ast(
+                ctx.proto,
+                ctx.slot_exprs,
+                stmts,
+                inst.a,
+                call_expr,
+                real_idx,
+            );
+        }
+        n => {
+            // Multiple results (B > 2). Method calls bail (no clean
+            // source shape for `local a, b = obj:m()`); regular calls
+            // emit LocalDeclMulti when every result slot is a fresh
+            // declaration.
+            if method {
+                return Err(DecompilerError::NotImplemented);
+            }
+            let names: Option<Vec<String>> = (0..n)
+                .map(|offset| {
+                    let slot = inst.a.saturating_add(offset as u8);
+                    if ctx.proto.is_var_declaration_at(slot, real_idx) {
+                        ctx.proto.var_name_at(slot, real_idx).map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            match names {
+                Some(names) => {
+                    // Every result slot is a fresh local declaration.
+                    // Record each slot as Expr::Var(name) so a later
+                    // read resolves to the local, and emit the
+                    // multi-name local declaration.
+                    for (offset, name) in names.iter().enumerate() {
+                        let slot = inst.a + offset as u8;
+                        ctx.slot_exprs.insert(slot, Expr::Var(name.clone()));
+                    }
+                    stmts.push(Stmt::LocalDeclMulti {
+                        names,
+                        expr: call_expr,
+                    });
+                }
+                None => return Err(DecompilerError::NotImplemented),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build the source [`Expr`] produced by a constant-load
@@ -3474,24 +3702,6 @@ mod tests {
         );
     }
 
-    /// Tail calls (CALLT/CALLMT) classify as Terminator::TailCall.
-    #[test]
-    fn recover_tail_call_is_not_supported() {
-        let module = module_with(
-            vec![ad(Opcode::Gget, 0, 0), ad(Opcode::Callt, 0, 2)],
-            Vec::new(),
-            vec![GcConst::Str(b"f".to_vec())],
-            Vec::new(),
-            1,
-        );
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for tail call, got {:?}",
-            result
-        );
-    }
-
     /// GGET with a non-string GC constant isn't supported.
     #[test]
     fn recover_gget_non_string_gc_const_is_not_supported() {
@@ -4958,13 +5168,19 @@ mod tests {
     }
 
     /// CALL with B == 0 (multres return — e.g. `local a, b, c = f()`)
-    /// bails with NotImplemented. Stage 15 territory.
+    /// is handled by Stage 16: the call expression is stored in slot A
+    /// without emitting a Stmt, and a later RETM/CALLM consumes it.
+    /// When there's no consumer (malformed bytecode), the call's side
+    /// effects are silently dropped — the recovery doesn't model
+    /// standalone multres-producing calls. This test pins that
+    /// behavior: the call expr is stored, no Stmt is emitted, and the
+    /// output is empty.
     #[test]
-    fn recover_call_multres_results_not_supported() {
+    fn recover_call_multres_results_no_consumer_emits_nothing() {
         let insts = vec![
             ad(Opcode::Gget, 0, 0),
             ad(Opcode::Kshort, 2, 1),
-            abc(Opcode::Call, 0, 0, 2), // B=0 → multres
+            abc(Opcode::Call, 0, 0, 2), // B=0 → multres, no consumer
             ad(Opcode::Ret0, 0, 1),
         ];
         let module = module_with(
@@ -4974,21 +5190,20 @@ mod tests {
             Vec::new(),
             3,
         );
-        let result = emit_module(&module);
-        assert!(
-            matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for multres CALL (B=0), got {:?}",
-            result
-        );
+        // No consumer → no emitted Stmt. The call expr is stored in
+        // slot 0 but never read.
+        assert_eq!(emit(&module), "");
     }
 
-    /// CALL with C == 0 (multres args — e.g. `f(...)`) bails with
-    /// NotImplemented. Stage 15 territory.
+    /// Bare CALL with C == 0 (multres args) never appears in
+    /// well-formed bytecode — LuaJIT emits CALLM for multres-arg
+    /// calls, not CALL. The recovery keeps bailing on this shape
+    /// (CALLM is the multres-args opcode, handled separately).
     #[test]
     fn recover_call_multres_args_not_supported() {
         let insts = vec![
             ad(Opcode::Gget, 0, 0),
-            abc(Opcode::Call, 0, 1, 0), // C=0 → multres args
+            abc(Opcode::Call, 0, 1, 0), // C=0 → bare multres args (malformed)
             ad(Opcode::Ret0, 0, 1),
         ];
         let module = module_with(
@@ -5001,7 +5216,7 @@ mod tests {
         let result = emit_module(&module);
         assert!(
             matches!(result, Err(DecompilerError::NotImplemented)),
-            "expected NotImplemented for multres CALL (C=0), got {:?}",
+            "expected NotImplemented for bare CALL with C=0, got {:?}",
             result
         );
     }
@@ -5543,7 +5758,7 @@ mod tests {
         assert_eq!(emit(&module), "f(1)");
     }
 
-    /// TSETM (multres table set, used for `{f()}`) is Stage 15. The
+    /// TSETM (multres table set, used for `{f()}`) is Stage 17. The
     /// recovery bails with NotImplemented. (Stage 14 added
     /// TSETS/TSETV/TSETB handlers — those are covered by the
     /// `recover_tset*` tests below.)
@@ -6432,5 +6647,568 @@ mod tests {
         };
         let params = extract_params(&proto);
         assert!(params.is_empty());
+    }
+
+    // ====================================================================
+    // Stage 16: multres (CALL B>2, CALLT, VARG, RETM, CALLM, CALL B=0)
+    // ====================================================================
+    //
+    // The integration tests in `tests/stage16_multres.rs` cover the
+    // end-to-end pipeline using real `luajit -bg` fixtures. The unit
+    // tests below isolate the individual opcode handlers and the
+    // `route_call_result` helper, exercising the edge cases that
+    // aren't covered by the fixtures (mixed declaration/temp slots,
+    // B>2 VARG, CALLM with C>0, RETM with D>0).
+
+    /// Helper: build a module whose main proto loads global `f` and
+    /// calls it with the given B/C operands, then RET0. Used by the
+    /// route_call_result unit tests.
+    fn module_with_call(b: u8, c: u8, var_info: Vec<VarInfo>, framesize: u8) -> Module {
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            abc(Opcode::Call, 0, b, c),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        module_with(
+            insts,
+            var_info,
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            framesize,
+        )
+    }
+
+    // ---- CALL with B > 2 (multi-result local declaration) -----------
+
+    /// `local a, b, c = f()` — three result slots, all declarations.
+    /// Verifies the Stmt::LocalDeclMulti payload directly.
+    #[test]
+    fn recover_call_multi_result_local_decl_multi() {
+        //   GGET 0 0      ; f at slot 0
+        //   CALL  0 4 1   ; A=0, B=4 (3 results), C=1 (0 args)
+        //   RET0  0 1.
+        let module = module_with_call(
+            4,
+            1,
+            vec![
+                named_local(0, "a", 1, 2),
+                named_local(1, "b", 1, 2),
+                named_local(2, "c", 1, 2),
+            ],
+            3,
+        );
+        let cfg = Cfg::build(module.main_proto());
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        assert_eq!(ast.len(), 1, "expected just [LocalDeclMulti]");
+        match &ast[0] {
+            Stmt::LocalDeclMulti { names, expr } => {
+                assert_eq!(
+                    names,
+                    &vec!["a".to_string(), "b".to_string(), "c".to_string()]
+                );
+                match expr {
+                    Expr::Call { func, args } => {
+                        assert_eq!(**func, Expr::Global("f".to_string()));
+                        assert!(args.is_empty(), "expected no args (C=1)");
+                    }
+                    other => panic!("expected Call expr, got {:?}", other),
+                }
+            }
+            other => panic!("expected LocalDeclMulti, got {:?}", other),
+        }
+    }
+
+    /// `local a, b, c = f()` end-to-end: the emitted source.
+    #[test]
+    fn emit_call_multi_result_local_decl_multi() {
+        let module = module_with_call(
+            4,
+            1,
+            vec![
+                named_local(0, "a", 1, 2),
+                named_local(1, "b", 1, 2),
+                named_local(2, "c", 1, 2),
+            ],
+            3,
+        );
+        assert_eq!(emit(&module), "local a, b, c = f()");
+    }
+
+    /// B > 2 with only SOME slots declared → NotImplemented (mixed
+    /// declaration/temp shape has no clean source representation).
+    #[test]
+    fn recover_call_multi_result_mixed_slots_bails() {
+        // Slots 0 and 1 are declarations; slot 2 is unnamed temp.
+        let module = module_with_call(
+            4,
+            1,
+            vec![named_local(0, "a", 1, 2), named_local(1, "b", 1, 2)],
+            3,
+        );
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for mixed declaration/temp slots, got {:?}",
+            result
+        );
+    }
+
+    /// B > 2 with NO slots declared → NotImplemented.
+    #[test]
+    fn recover_call_multi_result_no_decls_bails() {
+        let module = module_with_call(4, 1, Vec::new(), 3);
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for B>2 with no declarations, got {:?}",
+            result
+        );
+    }
+
+    /// B > 2 with reassigned (not declared) slots → NotImplemented.
+    /// The slots have names but `is_var_declaration_at` returns false
+    /// (the assignment is past the declaration point).
+    #[test]
+    fn recover_call_multi_result_reassignment_bails() {
+        let module = module_with_call(
+            4,
+            1,
+            vec![
+                VarInfo {
+                    kind: VarKind::Name,
+                    name: Some("a".to_string()),
+                    is_parameter: false,
+                    slot: 0,
+                    scope_begin: 0,
+                    scope_end: 2,
+                },
+                VarInfo {
+                    kind: VarKind::Name,
+                    name: Some("b".to_string()),
+                    is_parameter: false,
+                    slot: 1,
+                    scope_begin: 0,
+                    scope_end: 2,
+                },
+                VarInfo {
+                    kind: VarKind::Name,
+                    name: Some("c".to_string()),
+                    is_parameter: false,
+                    slot: 2,
+                    scope_begin: 0,
+                    scope_end: 2,
+                },
+            ],
+            3,
+        );
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for B>2 with reassigned slots, got {:?}",
+            result
+        );
+    }
+
+    // ---- CALL with B == 0 (multres results) ------------------------
+
+    /// B == 0 with no consumer: stores the call expr in slot 0, emits
+    /// nothing. The call's side effects are lost in the output (this
+    /// is malformed bytecode — well-formed B==0 always has a consumer).
+    #[test]
+    fn recover_call_b_zero_no_consumer_emits_nothing() {
+        //   GGET 0 0      ; f at slot 0
+        //   KSHORT 2 1    ; arg at slot 2
+        //   CALL  0 0 2   ; A=0, B=0 (multres), C=2 (1 arg)
+        //   RET0  0 1.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Kshort, 2, 1),
+            abc(Opcode::Call, 0, 0, 2),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            3,
+        );
+        assert_eq!(emit(&module), "");
+    }
+
+    /// B == 0 followed by RETM: the canonical `return f()` shape.
+    /// CALL stores Expr::Call in slot 0; RETM reads slot 0 and emits
+    /// `return f()`.
+    #[test]
+    fn recover_call_b_zero_with_retm_returns_call() {
+        //   GGET 0 0      ; f at slot 0
+        //   CALL  0 0 1   ; A=0, B=0 (multres), C=1 (0 args)
+        //   RETM  0 0.    ; return multres from slot 0
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            abc(Opcode::Call, 0, 0, 1),
+            ad(Opcode::Retm, 0, 0),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(emit(&module), "return f()");
+    }
+
+    // ---- VARG (varargs) ---------------------------------------------
+
+    /// `local x = ...` — VARG with B=2 (one fixed result). The slot
+    /// has a var_info declaration, so assign_slot_ast emits
+    /// `local x = ...`.
+    #[test]
+    fn recover_varg_single_result_local_decl() {
+        //   VARG 0 2 0    ; A=0, B=2 (1 result)
+        //   RET0 0 1.
+        let insts = vec![ad(Opcode::Varg, 0, 2), ad(Opcode::Ret0, 0, 1)];
+        // Build a vararg main proto directly (the test fixtures use
+        // Funcv for the main chunk; this matches the main-chunk
+        // convention).
+        use crate::ir::FLAG_FR2;
+        let mut insts_full = vec![Instruction::synthetic_header(Opcode::Funcv, 1)];
+        insts_full.extend(insts);
+        let module = Module {
+            header: ModuleHeader {
+                flags: FLAG_FR2,
+                chunkname: None,
+            },
+            protos: vec![Proto {
+                flags: crate::ir::PROTO_VARARG,
+                numparams: 0,
+                framesize: 1,
+                upvalues: Vec::<UpvalDesc>::new(),
+                gc_consts: Vec::new(),
+                num_consts: Vec::new(),
+                insts: insts_full,
+                debug: Some(DebugInfo {
+                    var_info: vec![named_local(0, "x", 0, 1)],
+                    ..DebugInfo::default()
+                }),
+            }],
+        };
+        assert_eq!(emit(&module), "local x = ...");
+    }
+
+    /// VARG with B > 2 (multiple fixed results) → NotImplemented.
+    /// Stage 16 doesn't model `local x, y = ...`.
+    #[test]
+    fn recover_varg_multi_result_bails() {
+        let insts = vec![ad(Opcode::Varg, 0, 4), ad(Opcode::Ret0, 0, 1)];
+        use crate::ir::FLAG_FR2;
+        let mut insts_full = vec![Instruction::synthetic_header(Opcode::Funcv, 3)];
+        insts_full.extend(insts);
+        let module = Module {
+            header: ModuleHeader {
+                flags: FLAG_FR2,
+                chunkname: None,
+            },
+            protos: vec![Proto {
+                flags: crate::ir::PROTO_VARARG,
+                numparams: 0,
+                framesize: 3,
+                upvalues: Vec::<UpvalDesc>::new(),
+                gc_consts: Vec::new(),
+                num_consts: Vec::new(),
+                insts: insts_full,
+                debug: Some(DebugInfo {
+                    var_info: vec![
+                        named_local(0, "x", 0, 1),
+                        named_local(1, "y", 0, 1),
+                        named_local(2, "z", 0, 1),
+                    ],
+                    ..DebugInfo::default()
+                }),
+            }],
+        };
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for VARG with B>2, got {:?}",
+            result
+        );
+    }
+
+    /// `return ...` — VARG with B=0 stores Expr::Vararg; RETM with
+    /// D=0 returns it. Verifies the AST shape directly.
+    #[test]
+    fn recover_varg_multres_with_retm_ast_shape() {
+        //   VARG 0 0 0    ; multres
+        //   RETM 0 0.
+        let insts = vec![ad(Opcode::Varg, 0, 0), ad(Opcode::Retm, 0, 0)];
+        use crate::ir::FLAG_FR2;
+        let mut insts_full = vec![Instruction::synthetic_header(Opcode::Funcv, 1)];
+        insts_full.extend(insts);
+        let module = Module {
+            header: ModuleHeader {
+                flags: FLAG_FR2,
+                chunkname: None,
+            },
+            protos: vec![Proto {
+                flags: crate::ir::PROTO_VARARG,
+                numparams: 0,
+                framesize: 1,
+                upvalues: Vec::<UpvalDesc>::new(),
+                gc_consts: Vec::new(),
+                num_consts: Vec::new(),
+                insts: insts_full,
+                debug: Some(DebugInfo::default()),
+            }],
+        };
+        let cfg = Cfg::build(module.main_proto());
+        let ast = recover(&module, 0, &cfg, true).expect("recover should succeed");
+        assert_eq!(ast.len(), 1, "expected just [Return]");
+        match &ast[0] {
+            Stmt::Return(Some(expr)) => assert_eq!(*expr, Expr::Vararg, "return expr"),
+            other => panic!("expected Return(Some(Vararg)), got {:?}", other),
+        }
+    }
+
+    // ---- RETM (return multres) --------------------------------------
+
+    /// RETM with D > 0 (known multres count) → NotImplemented. Stage
+    /// 16 only models the common D=0 case.
+    #[test]
+    fn recover_retm_nonzero_d_bails() {
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            abc(Opcode::Call, 0, 0, 1),
+            ad(Opcode::Retm, 0, 2), // D=2 → known count of 1
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            1,
+        );
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for RETM with D>0, got {:?}",
+            result
+        );
+    }
+
+    /// RETM with no previous instruction storing a slot expr → bail.
+    #[test]
+    fn recover_retm_missing_slot_bails() {
+        // Slot 0 never written before RETM. (CALL above uses B=1,
+        // not B=0, so it doesn't store anything in slot 0.)
+        let insts = vec![ad(Opcode::Retm, 0, 0)];
+        let module = module_with(insts, Vec::new(), Vec::new(), Vec::new(), 1);
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for RETM with missing slot, got {:?}",
+            result
+        );
+    }
+
+    // ---- CALLM (multres call args) ---------------------------------
+
+    /// `print(f())` — CALLM with C=0. End-to-end emit.
+    #[test]
+    fn emit_callm_multres_args() {
+        //   GGET 0 0      ; print at slot 0
+        //   GGET 2 1      ; f at slot 2
+        //   CALL 2 0 1    ; call f() → multres at slot 2
+        //   CALLM 0 1 0   ; call print(...) with multres args
+        //   RET0 0 1.
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Gget, 2, 1),
+            abc(Opcode::Call, 2, 0, 1),
+            abc(Opcode::Callm, 0, 1, 0),
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec()), GcConst::Str(b"print".to_vec())],
+            Vec::new(),
+            3,
+        );
+        assert_eq!(emit(&module), "print(f())");
+    }
+
+    /// CALLM with C > 0 (fixed args + trailing multres) → NotImplemented.
+    /// Stage 16 doesn't model the mixed case.
+    #[test]
+    fn recover_callm_fixed_args_bails() {
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Gget, 2, 1),
+            abc(Opcode::Call, 4, 0, 1),
+            abc(Opcode::Callm, 0, 1, 2), // C=2 → 1 fixed arg + multres
+            ad(Opcode::Ret0, 0, 1),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec()), GcConst::Str(b"print".to_vec())],
+            Vec::new(),
+            5,
+        );
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for CALLM with C>0, got {:?}",
+            result
+        );
+    }
+
+    /// CALLM with B=2 (single result) — `local x = print(f())` shape.
+    /// Verifies route_call_result handles CALLM the same way as CALL.
+    #[test]
+    fn recover_callm_single_result_local_decl() {
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Gget, 2, 1),
+            abc(Opcode::Call, 2, 0, 1),
+            abc(Opcode::Callm, 0, 2, 0), // B=2 → 1 result at slot 0
+            ad(Opcode::Ret1, 0, 2),
+        ];
+        let module = module_with(
+            insts,
+            vec![named_local(0, "x", 3, 4)],
+            vec![GcConst::Str(b"f".to_vec()), GcConst::Str(b"print".to_vec())],
+            Vec::new(),
+            3,
+        );
+        assert_eq!(emit(&module), "local x = print(f())\nreturn x");
+    }
+
+    // ---- CALLT (tail call via Terminator::TailCall) ----------------
+
+    /// `return f()` via CALLT — end-to-end emit.
+    #[test]
+    fn emit_tail_call_via_callt() {
+        //   GGET 0 0      ; f at slot 0
+        //   CALLT 0 1.    ; A=0, D=1 (0 args + 1)
+        let insts = vec![ad(Opcode::Gget, 0, 0), ad(Opcode::Callt, 0, 1)];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            2,
+        );
+        assert_eq!(emit(&module), "return f()");
+    }
+
+    /// `return f(1, 2)` via CALLT with two args.
+    #[test]
+    fn emit_tail_call_with_args() {
+        //   GGET   0 0    ; f at slot 0
+        //   KSHORT 2 1    ; arg 1 at slot 2
+        //   KSHORT 3 2    ; arg 2 at slot 3
+        //   CALLT  0 3.   ; A=0, D=3 (2 args + 1)
+        let insts = vec![
+            ad(Opcode::Gget, 0, 0),
+            ad(Opcode::Kshort, 2, 1),
+            ad(Opcode::Kshort, 3, 2),
+            ad(Opcode::Callt, 0, 3),
+        ];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            4,
+        );
+        assert_eq!(emit(&module), "return f(1, 2)");
+    }
+
+    /// CALLT with D=0 (multres args — CALLMT shape) → NotImplemented.
+    /// Stage 16 doesn't model multres tail calls.
+    #[test]
+    fn recover_callt_multres_args_bails() {
+        let insts = vec![ad(Opcode::Gget, 0, 0), ad(Opcode::Callt, 0, 0)];
+        let module = module_with(
+            insts,
+            Vec::new(),
+            vec![GcConst::Str(b"f".to_vec())],
+            Vec::new(),
+            2,
+        );
+        let result = emit_module(&module);
+        assert!(
+            matches!(result, Err(DecompilerError::NotImplemented)),
+            "expected NotImplemented for CALLT with D=0, got {:?}",
+            result
+        );
+    }
+
+    // ---- FNEW with vararg child ------------------------------------
+
+    /// `local f = function(...) return ... end` — child proto is
+    /// vararg (PROTO_VARARG flag set). Stage 16 appends `...` to the
+    /// parameter list.
+    #[test]
+    fn emit_fnew_vararg_child() {
+        // child: VARG 0 0 0; RETM 0 0.
+        let module = module_with_child(
+            vec![ad(Opcode::Varg, 0, 0), ad(Opcode::Retm, 0, 0)],
+            Vec::new(),
+            0, // numparams
+            1, // framesize
+            // main: FNEW 0 0; RET0 0 1.
+            vec![ad(Opcode::Fnew, 0, 0), ad(Opcode::Ret0, 0, 1)],
+            vec![named_local(0, "f", 0, 1)],
+            1,
+        );
+        // Mark the child proto as vararg.
+        let mut module = module;
+        module.protos[0].flags |= crate::ir::PROTO_VARARG;
+        assert_eq!(
+            emit(&module),
+            "local f = function(...)\n    return ...\nend"
+        );
+    }
+
+    /// `local f = function(a, ...) return a end` — child has 1 param
+    /// plus vararg. Stage 16 appends `...` after the named param.
+    #[test]
+    fn emit_fnew_param_plus_vararg() {
+        let module = module_with_child(
+            vec![ad(Opcode::Ret1, 0, 2)],
+            vec![param_local(0, "a")],
+            1, // numparams
+            1, // framesize
+            vec![ad(Opcode::Fnew, 0, 0), ad(Opcode::Ret0, 0, 1)],
+            vec![named_local(0, "f", 0, 1)],
+            1,
+        );
+        let mut module = module;
+        module.protos[0].flags |= crate::ir::PROTO_VARARG;
+        assert_eq!(
+            emit(&module),
+            "local f = function(a, ...)\n    return a\nend"
+        );
+    }
+
+    /// FNEW with non-vararg child → no `...` appended. Regression
+    /// test: the vararg-append logic must not fire for normal protos.
+    #[test]
+    fn emit_fnew_non_vararg_child_no_dots() {
+        let module = module_with_child(
+            vec![ad(Opcode::Ret1, 0, 2)],
+            vec![param_local(0, "x")],
+            1,
+            1,
+            vec![ad(Opcode::Fnew, 0, 0), ad(Opcode::Ret0, 0, 1)],
+            vec![named_local(0, "f", 0, 1)],
+            1,
+        );
+        // Don't set PROTO_VARARG — should produce `function(x)`.
+        assert_eq!(emit(&module), "local f = function(x)\n    return x\nend");
     }
 }

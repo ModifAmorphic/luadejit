@@ -197,6 +197,12 @@ fn format_stmt(stmt: &Stmt, indent: usize) -> Option<String> {
             out.push_str(&format_expr(cond, indent));
             Some(out)
         }
+        Stmt::LocalDeclMulti { names, expr } => Some(format!(
+            "{}local {} = {}",
+            pad,
+            names.join(", "),
+            format_expr(expr, indent)
+        )),
     }
 }
 
@@ -269,6 +275,7 @@ fn format_expr(expr: &Expr, indent: usize) -> String {
         Expr::Table { entries } => format_table(entries, indent),
         Expr::Len(inner) => format!("#{}", format_expr(inner, indent)),
         Expr::Function { params, body } => format_function(params, body, indent),
+        Expr::Vararg => "...".to_string(),
     }
 }
 
@@ -1018,6 +1025,69 @@ mod tests {
             body: vec![],
         }));
         assert_eq!(format_stmt(&stmt, 0).unwrap(), "return function()\nend");
+    }
+
+    // ---- Stage 16: multres (LocalDeclMulti, Vararg) formatting ------
+
+    #[test]
+    fn formats_vararg_expr() {
+        // `...` — bare Vararg expression.
+        assert_eq!(format_expr(&Expr::Vararg, 0), "...");
+    }
+
+    #[test]
+    fn formats_local_decl_multi() {
+        // `local a, b, c = f()` — multi-name local declaration.
+        let stmt = Stmt::LocalDeclMulti {
+            names: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            expr: Expr::Call {
+                func: Box::new(Expr::Global("f".to_string())),
+                args: vec![],
+            },
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "local a, b, c = f()");
+    }
+
+    #[test]
+    fn formats_local_decl_multi_two_names() {
+        // `local x, y = f()` — two-name variant.
+        let stmt = Stmt::LocalDeclMulti {
+            names: vec!["x".to_string(), "y".to_string()],
+            expr: Expr::Call {
+                func: Box::new(Expr::Global("g".to_string())),
+                args: vec![Expr::Int(1)],
+            },
+        };
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "local x, y = g(1)");
+    }
+
+    #[test]
+    fn formats_local_decl_multi_at_nonzero_indent() {
+        // Inside an indented block (Stage 16 doesn't recover this
+        // shape nested, but the formatter must still handle it).
+        let stmt = Stmt::LocalDeclMulti {
+            names: vec!["a".to_string(), "b".to_string()],
+            expr: Expr::Vararg,
+        };
+        assert_eq!(format_stmt(&stmt, 1).unwrap(), "    local a, b = ...");
+    }
+
+    #[test]
+    fn formats_return_with_vararg_expr() {
+        // `return ...` — Vararg as the returned expr (the shape
+        // Stage 16's RETM handler emits).
+        let stmt = Stmt::Return(Some(Expr::Vararg));
+        assert_eq!(format_stmt(&stmt, 0).unwrap(), "return ...");
+    }
+
+    #[test]
+    fn formats_call_with_vararg_arg() {
+        // `f(...)` — Vararg as a call argument (CALLM with VARG).
+        let expr = Expr::Call {
+            func: Box::new(Expr::Global("f".to_string())),
+            args: vec![Expr::Vararg],
+        };
+        assert_eq!(format_expr(&expr, 0), "f(...)");
     }
 
     #[test]
